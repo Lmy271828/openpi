@@ -3,6 +3,7 @@ import os
 import pathlib
 from typing import Any
 
+import jax
 import jax.numpy as jnp
 
 import openpi.models.model as _model
@@ -54,7 +55,12 @@ def create_trained_policy(
         model = train_config.model.load_pytorch(train_config, weight_path)
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
-        model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
+        # Force CPU loading to avoid GPU OOM on 8GB VRAM cards
+        cpu_device = jax.devices("cpu")[0]
+        mesh = jax.sharding.Mesh([cpu_device], ("x",))
+        cpu_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+        params = _model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16, sharding=cpu_sharding)
+        model = train_config.model.load(params)
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     if norm_stats is None:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
