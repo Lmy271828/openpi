@@ -138,9 +138,9 @@ sudo docker run --rm -it --runtime nvidia \
 
 ---
 
-## Step 4：性能数据采集（Thor 容器内，本分支工具）
+## Step4：性能数据采集（Thor 容器内，本分支工具）
 
-一键采集（sweep + PyTorch/TRT 两路 nsys + GPU metrics + trtexec 产物）：
+一键采集（sweep + PyTorch/TRT 两路 nsys + GPU metrics + 内嵌 tegrastats EMC + trtexec 产物）：
 
 ```bash
 # 可选环境变量：CONFIG_NAME(=pi05_libero) NUM_WARMUP(=3) NUM_TEST_RUNS(=10)
@@ -155,10 +155,13 @@ numsteps_sweep_<config>_w<W>_r<R>.csv                      # num_steps 扫描
 pi05_ptcompile_<config>_w<W>_r<R>{.nsys-rep,.sqlite,_*.csv}  # PyTorch torch.compile
 pi05_trt_<engine-tag>_<config>_w<W>_r<R>{.nsys-rep,...}      # TensorRT，engine-tag 取自
                                                              # 引擎文件名（如 fp8_nvfp4）
+<prefix>_emc.log                                           # tegrastats 原始采样（EMC%/GR3D%）
+<prefix>_console.log                                       # 控制台全量输出（含分阶段 EMC 表）
 ```
 
 **DRAM 带宽（EMC）采集**：Thor 是 Tegra 统一内存架构，nsys GPU metrics **不含 DRAM 计数器**
-（DRAM 挂在 SoC 侧 EMC），用 tegrastats 补齐——已嵌入推理脚本，与推理阶段自动对齐：
+（DRAM 挂在 SoC 侧 EMC），用 tegrastats 补齐——已嵌入推理脚本并经 `--tegrastats-log`
+并入上面的一键采集（与 nsys 同一进程、时间轴天然对齐），无需单独跑。手工单独采集时：
 
 ```bash
 python deployment_scripts/pi05_inference_nvtx.py \

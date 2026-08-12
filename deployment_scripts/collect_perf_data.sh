@@ -4,19 +4,27 @@
 # Additive deployment-side script — does NOT modify any existing file.
 # Run INSIDE the Thor Docker container (after Step 5 env setup):
 #
-#   bash deployment_scripts/collect_perf_data.sh [path-to-pi05_pt.nsys-rep]
+#   bash deployment_scripts/collect_perf_data.sh
 #
 # Overridable env vars (with defaults):
 #   CONFIG_NAME=pi05_libero   CKPT_DIR=<derived>   ENGINE_PATH=<derived>
 #   NUM_WARMUP=3              NUM_TEST_RUNS=10
+#
+# Each backend run is captured by two instruments from the same process:
+#   - nsys (--gpu-metrics-device=all): kernel times + SM/Tensor activity,
+#     i.e. compute-side occupancy per NVTX stage (see analyze_perf.py).
+#   - tegrastats (embedded via --tegrastats-log): EMC% (DRAM controller)
+#     and GR3D% per phase — the only DRAM bandwidth source on Thor, where
+#     the nsys GPU-metrics set has no DRAM counter.
 #
 # Output naming — every artifact prefix encodes the backend and the capture
 # hyperparameters, so runs with different settings never overwrite each other:
 #   numsteps_sweep_<config>_w<warmup>_r<runs>.csv
 #   pi05_ptcompile_<config>_w<warmup>_r<runs>{.nsys-rep,.sqlite,_*.csv}
 #   pi05_trt_<engine-tag>_<config>_w<warmup>_r<runs>{.nsys-rep,.sqlite,_*.csv}
-#   pi05_pteager_*  (from the pre-existing eager rep; its capture hyperparams
-#                    are unknown, so the prefix stays fixed)
+# plus, per backend run:
+#   <prefix>_emc.log      raw tegrastats samples (EMC%/GR3D%)
+#   <prefix>_console.log  console output incl. the per-phase EMC/GR3D table
 # where <engine-tag> is the engine basename minus "model_" and ".engine"
 # (e.g. model_fp8_nvfp4.engine -> fp8_nvfp4).
 #
@@ -41,13 +49,11 @@ CKPT="${CKPT_DIR:-$HOME/.cache/openpi/openpi-assets/checkpoints/${CONFIG_NAME}_p
 ENGINE="${ENGINE_PATH:-$CKPT/engine/model_fp8_nvfp4.engine}"
 NUM_WARMUP="${NUM_WARMUP:-3}"
 NUM_TEST_RUNS="${NUM_TEST_RUNS:-10}"
-PT_REP="${1:-pi05_pt.nsys-rep}"   # existing PyTorch nsys report (arg 1 overrides)
 OUT="perf_data"
 mkdir -p "$OUT"
 
 # Output prefixes: backend [+ engine precision] + config + capture hyperparams.
 ENGINE_TAG=$(basename "$ENGINE" .engine); ENGINE_TAG="${ENGINE_TAG#model_}"
-PT_TAG="pi05_pteager"   # legacy eager rep: capture hyperparams unknown, fixed prefix
 PTC_TAG="pi05_ptcompile_${CONFIG_NAME}_w${NUM_WARMUP}_r${NUM_TEST_RUNS}"
 TRT_TAG="pi05_trt_${ENGINE_TAG}_${CONFIG_NAME}_w${NUM_WARMUP}_r${NUM_TEST_RUNS}"
 SWEEP_CSV="$OUT/numsteps_sweep_${CONFIG_NAME}_w${NUM_WARMUP}_r${NUM_TEST_RUNS}.csv"
@@ -57,14 +63,12 @@ echo "  CONFIG_NAME=$CONFIG_NAME"
 echo "  CKPT=$CKPT"
 echo "  ENGINE=$ENGINE (tag: $ENGINE_TAG)"
 echo "  NUM_WARMUP=$NUM_WARMUP  NUM_TEST_RUNS=$NUM_TEST_RUNS"
-echo "  PT_REP=$PT_REP"
 echo "  OUT=$OUT"
-echo "  prefixes: $PT_TAG / $PTC_TAG / $TRT_TAG"
+echo "  prefixes: $PTC_TAG / $TRT_TAG"
 echo "  sweep csv: $SWEEP_CSV"
 
 run_stats () {  # $1=rep path, $2=output prefix
-    # gpumetrics needs the rep to be captured with --gpu-metrics-device=all;
-    # on reps without it (e.g. the legacy eager rep) nsys just skips the report.
+    # gpumetrics needs the rep to be captured with --gpu-metrics-device=all.
     nsys stats "$1" \
         --report cuda_gpu_kern_sum \
         --report cuda_gpu_mem_time_sum \
@@ -76,8 +80,25 @@ run_stats () {  # $1=rep path, $2=output prefix
         -o "$2" 2>&1 | tail -3
 }
 
+run_infer () {  # $1=output prefix, rest=extra args for pi05_inference_nvtx.py
+    # One process, two instruments: nsys for compute-side metrics, embedded
+    # tegrastats for DRAM/EMC. Full console output is tee'd to <prefix>_console.log
+    # so the per-phase EMC/GR3D table survives the tail on stdout.
+    local tag="$1"; shift
+    nsys profile -o "$OUT/$tag" --force-overwrite=true -t cuda,nvtx \
+        --gpu-metrics-device=all \
+        python deployment_scripts/pi05_inference_nvtx.py \
+            --config-name "$CONFIG_NAME" \
+            --checkpoint-dir "$CKPT" \
+            --num-warmup "$NUM_WARMUP" --num-test-runs "$NUM_TEST_RUNS" \
+            --tegrastats-log "$OUT/${tag}_emc.log" \
+            "$@" \
+        2>&1 | tee "$OUT/${tag}_console.log" | tail -20
+    run_stats "$OUT/$tag.nsys-rep" "$OUT/$tag"
+}
+
 echo ""
-echo "== [1/5] num_steps sweep (PyTorch backend) =="
+echo "== [1/4] num_steps sweep (PyTorch backend) =="
 python deployment_scripts/pi05_numsteps_sweep.py \
     --config-name "$CONFIG_NAME" \
     --checkpoint-dir "$CKPT" \
@@ -86,54 +107,22 @@ python deployment_scripts/pi05_numsteps_sweep.py \
     --output-csv "$SWEEP_CSV"
 
 echo ""
-echo "== [2/5] nsys stats for existing PyTorch report =="
-# NOTE: the existing pi05_pt.nsys-rep was captured with --profile-eager
-# (Eager PyTorch, NOT torch.compile) — keep it as the eager reference.
-if [ -f "$PT_REP" ]; then
-    run_stats "$PT_REP" "$OUT/$PT_TAG"
-else
-    echo "  SKIP: $PT_REP not found (pass its path as arg 1)"
-fi
+echo "== [2/4] torch.compile PyTorch: nsys + tegrastats =="
+# Default path = torch.compile(max-autotune), matching the PyTorch baseline.
+# In-graph stage probes do not fire here; for stage attribution run
+# pi05_inference_nvtx.py with --profile-eager separately.
+run_infer "$PTC_TAG" --inference-mode pytorch
 
 echo ""
-echo "== [3/5] nsys profile + stats for torch.compile PyTorch run =="
-# Prefer the NVTX-annotated variant if present on Thor; without
-# --profile-eager it runs the default torch.compile(max-autotune) path,
-# matching the pytorch_baseline.png numbers.
-PT_SCRIPT="deployment_scripts/pi05_inference_nvtx.py"
-[ -f "$PT_SCRIPT" ] || PT_SCRIPT="deployment_scripts/pi05_inference.py"
-echo "  using $PT_SCRIPT (default = torch.compile enabled)"
-# --gpu-metrics-device=all samples GPU counters (clocks, SM/Tensor activity,
-# DRAM throughput where the device exposes it) for the bandwidth analysis.
-nsys profile -o "$OUT/$PTC_TAG" --force-overwrite=true -t cuda,nvtx \
-    --gpu-metrics-device=all \
-    python "$PT_SCRIPT" \
-        --config-name "$CONFIG_NAME" \
-        --checkpoint-dir "$CKPT" \
-        --inference-mode pytorch \
-        --num-warmup "$NUM_WARMUP" --num-test-runs "$NUM_TEST_RUNS" \
-    2>&1 | tail -15
-run_stats "$OUT/$PTC_TAG.nsys-rep" "$OUT/$PTC_TAG"
-
-echo ""
-echo "== [4/5] nsys profile + stats for TensorRT run =="
+echo "== [3/4] TensorRT: nsys + tegrastats =="
 if [ -f "$ENGINE" ]; then
-    nsys profile -o "$OUT/$TRT_TAG" --force-overwrite=true -t cuda,nvtx \
-        --gpu-metrics-device=all \
-        python deployment_scripts/pi05_inference.py \
-            --config-name "$CONFIG_NAME" \
-            --checkpoint-dir "$CKPT" \
-            --engine-path "$ENGINE" \
-            --inference-mode tensorrt \
-            --num-warmup "$NUM_WARMUP" --num-test-runs "$NUM_TEST_RUNS" \
-        2>&1 | tail -15
-    run_stats "$OUT/$TRT_TAG.nsys-rep" "$OUT/$TRT_TAG"
+    run_infer "$TRT_TAG" --inference-mode tensorrt --engine-path "$ENGINE"
 else
     echo "  SKIP: engine not found at $ENGINE (set ENGINE_PATH)"
 fi
 
 echo ""
-echo "== [5/5] trtexec build artifacts (per-layer profile) =="
+echo "== [4/4] trtexec build artifacts (per-layer profile) =="
 for f in "${ENGINE}_profile.json" "${ENGINE}_layers.json" "${ENGINE}.log"; do
     if [ -f "$f" ]; then cp -v "$f" "$OUT/"; else echo "  SKIP: $f not found"; fi
 done
