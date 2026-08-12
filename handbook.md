@@ -169,9 +169,10 @@ python deployment_scripts/pi05_inference_nvtx.py \
   --checkpoint-dir ~/.cache/openpi/openpi-assets/checkpoints/${CONFIG_NAME}_pytorch \
   --inference-mode tensorrt \
   --engine-path ~/.cache/openpi/openpi-assets/checkpoints/${CONFIG_NAME}_pytorch/engine/model_fp8_nvfp4.engine \
-  --tegrastats-log perf_data/emc_trt.log
+  --tegrastats-log perf_data/pi05_trt_fp8_nvfp4_${CONFIG_NAME}_w3_r10_emc.log
 # 输出 warmup / inference_test 两阶段的 EMC% 均值/峰值与换算 GB/s（峰值 273 GB/s），
-# 并写 emc_trt.log.windows.json 供离线重新对齐
+# 并写 <同前缀>.windows.json 供离线重新对齐；
+# 文件名遵循一键脚本规范 <prefix>_emc.log（w/r 与实际 --num-warmup/--num-test-runs 一致）
 ```
 
 > 判读参考：EMC% 稳态 >80% 才是带宽瓶颈；本模型两阶段 SM Issue 仅 ~9–20%，
