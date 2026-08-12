@@ -120,6 +120,29 @@ def test_windows(con):
         return []
 
 
+def stage_ranges(con, t0, t1):
+    """prefill/expert sub-ranges of one test window, from the NVTX stage probes.
+
+    Returns (prefill_ranges, expert_ranges) using S2_paligemma_prefill and
+    S3_denoise_step_XX (pi05_inference_nvtx.py stage probes). Both empty when
+    the capture has no stage probes (e.g. the monolithic TRT engine path, where
+    engine internals are not NVTX-annotated) — callers should fall back to the
+    whole test window then.
+    """
+    try:
+        rows = con.execute(
+            "SELECT s.value, n.start, n.end FROM NVTX_EVENTS n JOIN StringIds s ON n.textId=s.id "
+            "WHERE n.start>=? AND n.start<? "
+            "AND (s.value='S2_paligemma_prefill' OR s.value GLOB 'S3_denoise_step_*')",
+            (t0, t1),
+        ).fetchall()
+    except Exception:
+        return [], []
+    prefill = [(s, e) for v, s, e in rows if v == "S2_paligemma_prefill"]
+    expert = [(s, e) for v, s, e in rows if v.startswith("S3_denoise_step_")]
+    return prefill, expert
+
+
 # ---------------------------------------------------------------------------
 # sections
 # ---------------------------------------------------------------------------
@@ -363,6 +386,40 @@ def section_dram(perf_dir, peak_gbps=None):
                 else:
                     cells += [f"{mean:.2f}", f"{peak:.0f}"]
             rows.append(cells)
+
+        # Precise prefill/expert split via the S2/S3 NVTX stage probes
+        # (pi05_inference_nvtx.py), replacing the old time-fraction estimate
+        # (handbook §4.3). Only possible when the capture has stage probes —
+        # the monolithic TRT engine path has none and keeps the window-level
+        # stats above. Covers the §7.3 saturation metrics as well, so this
+        # table supersedes the manual GPU_METRICS slicing in the handbook.
+        phase_rows = []
+        if wins:
+            prefill, expert = stage_ranges(con, *wins[len(wins) // 2])
+            if prefill or expert:
+                sat = [(mid, name) for mid, name in catalog
+                       if re.search(r"SMs Active|SM Issue|Tensor Active", name)]
+                seen = {mid for mid, _ in dram}
+                phase_metrics = dram + [(mid, name) for mid, name in sat if mid not in seen]
+
+                def agg_ranges(metric_id, ranges):
+                    vals = [v for v in (agg(metric_id, a, b) for a, b in ranges) if v]
+                    if not vals:
+                        return None
+                    return (sum(v[0] for v in vals) / len(vals), max(v[1] for v in vals))
+
+                for mid, name in phase_metrics:
+                    unit_m = re.search(r"\[([^\]]+)\]\s*$", name)
+                    unit = unit_m.group(1) if unit_m else ""
+                    label_name = re.sub(r"\s*\[[^\]]+\]\s*$", "", name)
+                    for phase_name, ranges in (("prefill (S2)", prefill), ("expert (S3)", expert)):
+                        stats = agg_ranges(mid, ranges)
+                        if stats is None:
+                            phase_rows.append([label_name, unit, phase_name, 0, "-", "-"])
+                        else:
+                            mean, peak = stats
+                            phase_rows.append([label_name, unit, phase_name, len(ranges),
+                                               f"{mean:.2f}", f"{peak:.0f}"])
         con.close()
 
         lines = [f"**{stem}**"]
@@ -372,6 +429,12 @@ def section_dram(perf_dir, peak_gbps=None):
         if wins:
             headers += ["test 窗口均值", "test 窗口峰值"]
         lines.append(md_table(headers, rows))
+        if phase_rows:
+            lines.append("\n分阶段饱和度（S2/S3 NVTX 探针精确切窗，中位 test 窗口）：\n")
+            lines.append(md_table(["指标", "单位", "阶段", "窗口数", "均值", "峰值"], phase_rows))
+        elif wins:
+            lines.append("\n_采集不含 S2/S3 NVTX 探针（如 TRT 引擎路径内部不可标注），"
+                         "无法精确切分 prefill/expert，仅有 test 窗口整体统计。_")
         out.append("\n".join(lines))
 
     if not out:

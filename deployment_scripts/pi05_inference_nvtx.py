@@ -17,6 +17,9 @@ Differences vs. the stock deployment_scripts/pi05_inference.py:
        S_trt_engine_forward    (TRT path only; engine internals are monolithic)
   3. --profile-eager strips the torch.compile wrapper from sample_actions so the
      in-graph stage probes actually reach the nsys timeline.
+  4. --tegrastats-log runs tegrastats alongside inference and reports EMC (DRAM
+     controller) / GR3D (GPU) utilization per phase — the zero-privilege DRAM
+     source on Thor, where the nsys GPU-metrics set has no DRAM counter.
 
 Patch points verified against openpi commit 15a9616a (src/openpi/models_pytorch/
 pi0_pytorch.py): sample_actions -> embed_prefix -> PaliGemmaWithExpertModel.forward
@@ -35,8 +38,13 @@ Usage:
 """
 
 import argparse
+import json
 import logging
+import math
 import os
+import re
+import shutil
+import subprocess
 import time
 
 import numpy as np
@@ -51,6 +59,120 @@ from openpi.training import config as _config
 
 # Configure logging to show INFO messages
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+
+# ---------------------------------------------------------------------------
+# tegrastats logging (Thor EMC/GR3D sampling aligned to inference phases)
+# ---------------------------------------------------------------------------
+
+class TegrastatsLogger:
+    """Run tegrastats during inference and report per-phase EMC/GR3D utilization.
+
+    tegrastats is the zero-privilege DRAM source on Thor: the nsys GPU-metrics
+    set on Tegra has no DRAM counter, but tegrastats reports EMC_FREQ (memory
+    controller) and GR3D_FREQ (GPU) utilization on every sample.
+
+    tegrastats log lines carry no timestamps, so sample k is approximated as
+    covering [t0 + k*dt, t0 + (k+1)*dt) with t0 = process spawn time. Alignment
+    is therefore done at phase granularity (warmup / inference_test): with a
+    100 ms interval and ~50 ms per inference, per-test_i alignment is noise.
+
+    A `<log>.windows.json` sidecar (t0, interval, phase boundaries) is written
+    so the raw log can be re-aligned offline. No-ops with a warning when
+    tegrastats is not on PATH (e.g. x86 dev host).
+    """
+
+    _EMC_RE = re.compile(r"EMC_FREQ\s+(\d+)%")
+    _GR3D_RE = re.compile(r"GR3D_FREQ\s+(\d+)%")
+
+    def __init__(self, log_path, interval_ms=100, peak_gbps=273.0):
+        self.log_path = log_path
+        self.dt = interval_ms / 1000.0
+        self.peak_gbps = peak_gbps  # Thor peak, driver-reported (TARGET_INFO_GPU.memoryBandwidth)
+        self.proc = None
+        self.t0 = None
+        self.enabled = shutil.which("tegrastats") is not None
+        if not self.enabled:
+            print("  [tegrastats] WARNING: tegrastats not found on PATH; EMC/GR3D logging disabled")
+
+    def start(self):
+        if not self.enabled or self.proc is not None:
+            return
+        self._fh = open(self.log_path, "w")
+        self.proc = subprocess.Popen(
+            ["tegrastats", "--interval", str(int(self.dt * 1000))],
+            stdout=self._fh,
+            stderr=subprocess.DEVNULL,
+        )
+        self.t0 = time.time()
+
+    def stop(self):
+        if self.proc is None:
+            return
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+        self._fh.close()
+        self.proc = None
+
+    def report(self, title, phases):
+        """Print per-phase EMC/GR3D stats. phases: [(name, start_wall, end_wall)]."""
+        if not self.enabled or self.t0 is None:
+            return
+        with open(self.log_path) as f:
+            lines = f.read().splitlines()
+        samples = [
+            (int(me.group(1)), int(mg.group(1)))
+            for line in lines
+            if (me := self._EMC_RE.search(line)) and (mg := self._GR3D_RE.search(line))
+        ]
+        if not samples:
+            print("  [tegrastats] no EMC/GR3D samples parsed from log")
+            return
+
+        with open(self.log_path + ".windows.json", "w") as f:
+            json.dump(
+                {
+                    "tegrastats_log": self.log_path,
+                    "interval_ms": int(self.dt * 1000),
+                    "t0_wallclock": self.t0,
+                    "phases": [(nm, s, e) for nm, s, e in phases],
+                },
+                f,
+                indent=1,
+            )
+
+        def row(name, seg):
+            if not seg:
+                return (name, 0, "-", "-", "-", "-", "-")
+            se = [s[0] for s in seg]
+            sg = [s[1] for s in seg]
+            emc_mean = sum(se) / len(se)
+            return (
+                name,
+                len(seg),
+                f"{emc_mean:.1f}",
+                f"{max(se)}",
+                f"{emc_mean / 100 * self.peak_gbps:.0f}",
+                f"{sum(sg) / len(sg):.1f}",
+                f"{max(sg)}",
+            )
+
+        def phase_seg(s, e):
+            i0 = max(0, math.ceil((s - self.t0) / self.dt))
+            i1 = min(len(samples), max(i0, int((e - self.t0) / self.dt)))
+            return samples[i0:i1]
+
+        rows = [row(name, phase_seg(s, e)) for name, s, e in phases]
+        rows.append(row("overall", samples))
+
+        print(f"\n== tegrastats — {title} ({len(samples)} samples @ {int(self.dt * 1000)} ms, log: {self.log_path}) ==")
+        print(f"{'phase':<16}{'samples':>8}{'EMC% mean':>10}{'EMC% max':>9}{'DRAM GB/s':>10}{'GR3D% mean':>11}{'GR3D% max':>10}")
+        for r in rows:
+            print(f"{r[0]:<16}{r[1]:>8}{r[2]:>10}{r[3]:>9}{r[4]:>10}{r[5]:>11}{r[6]:>10}")
+        print(f"  DRAM GB/s ≈ EMC% mean × {self.peak_gbps:.0f} GB/s（Thor 峰值，驱动上报值）")
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +420,7 @@ def load_example(config, use_dataset, sample_idx):
 # ---------------------------------------------------------------------------
 
 
-def run_pytorch_inference(config, checkpoint_dir, example, noise=None, num_warmup=3, num_test_runs=10, profile_eager=False):
+def run_pytorch_inference(config, checkpoint_dir, example, noise=None, num_warmup=3, num_test_runs=10, profile_eager=False, ts_logger=None):
     """Run PyTorch inference with warmup and multiple test runs."""
     print("\n--- PyTorch Inference ---")
     print("Loading policy...")
@@ -331,13 +453,18 @@ def run_pytorch_inference(config, checkpoint_dir, example, noise=None, num_warmu
         print("         (Absolute latency will be higher in eager mode; use compiled")
         print("         runs for the latency ledger, eager runs for the timeline.)")
 
+    if ts_logger:
+        ts_logger.start()
+
     # Warmup runs
     print(f"\nWarming up ({num_warmup} runs)...")
+    ts_warmup_start = time.time()
     with nvtx.annotate("warmup", color="blue"):
         for i in range(num_warmup):
             with nvtx.annotate(f"warmup_{i}", color="cyan"):
                 _ = policy.infer(example, noise=noise)
             print(f"  Warmup {i + 1}/{num_warmup} completed")
+    ts_test_start = time.time()
 
     # Test runs
     print(f"\nRunning inference tests ({num_test_runs} runs)...")
@@ -366,6 +493,15 @@ def run_pytorch_inference(config, checkpoint_dir, example, noise=None, num_warmu
 
             print(f"  Test {i + 1}/{num_test_runs}: {inference_time:.2f} ms")
 
+    ts_test_end = time.time()
+
+    if ts_logger:
+        ts_logger.stop()
+        ts_logger.report(
+            "PyTorch",
+            [("warmup", ts_warmup_start, ts_test_start), ("inference_test", ts_test_start, ts_test_end)],
+        )
+
     del policy
 
     # Calculate statistics
@@ -389,7 +525,7 @@ def run_pytorch_inference(config, checkpoint_dir, example, noise=None, num_warmu
 
 
 def run_tensorrt_inference(
-    config, checkpoint_dir, engine_path, example, noise=None, num_warmup=3, num_test_runs=10
+    config, checkpoint_dir, engine_path, example, noise=None, num_warmup=3, num_test_runs=10, ts_logger=None
 ):
     """Run TensorRT inference with warmup and multiple test runs."""
     print("\n--- TensorRT Inference ---")
@@ -417,13 +553,18 @@ def run_tensorrt_inference(
     # Bracket the (monolithic) engine forward after the TRT hooks replaced it
     install_trt_probe(policy)
 
+    if ts_logger:
+        ts_logger.start()
+
     # Warmup runs
     print(f"\nWarming up ({num_warmup} runs)...")
+    ts_warmup_start = time.time()
     with nvtx.annotate("warmup", color="blue"):
         for i in range(num_warmup):
             with nvtx.annotate(f"warmup_{i}", color="cyan"):
                 _ = policy.infer(example, noise=noise)
             print(f"  Warmup {i + 1}/{num_warmup} completed")
+    ts_test_start = time.time()
 
     # Test runs
     print(f"\nRunning inference tests ({num_test_runs} runs)...")
@@ -451,6 +592,15 @@ def run_tensorrt_inference(
                 action_chunk = result["actions"]
 
             print(f"  Test {i + 1}/{num_test_runs}: {inference_time:.2f} ms")
+
+    ts_test_end = time.time()
+
+    if ts_logger:
+        ts_logger.stop()
+        ts_logger.report(
+            "TensorRT",
+            [("warmup", ts_warmup_start, ts_test_start), ("inference_test", ts_test_start, ts_test_end)],
+        )
 
     del policy
 
@@ -609,6 +759,20 @@ def main():
         "ranges (S1/S2/S3) appear on the nsys timeline. Absolute latency will be higher "
         "than the compiled baseline; use this for stage attribution, not for the ledger.",
     )
+    parser.add_argument(
+        "--tegrastats-log",
+        type=str,
+        default=None,
+        help="Thor only: run tegrastats during inference and write the raw log here; "
+        "per-phase EMC (DRAM) / GR3D (GPU) utilization is printed after each backend run "
+        "and <path>.windows.json records the phase boundaries for offline re-alignment.",
+    )
+    parser.add_argument(
+        "--tegrastats-interval",
+        type=int,
+        default=100,
+        help="tegrastats sampling interval in ms (default: 100)",
+    )
     args = parser.parse_args()
 
     # Set engine path default if not provided
@@ -623,6 +787,10 @@ def main():
     # Load config
     config = _config.get_config(args.config_name)
     checkpoint_dir = args.checkpoint_dir
+
+    ts_logger = None
+    if args.tegrastats_log:
+        ts_logger = TegrastatsLogger(args.tegrastats_log, interval_ms=args.tegrastats_interval)
 
     if args.inference_mode == "compare":
         # Compare mode: run both and compare
@@ -666,6 +834,7 @@ def main():
             noise=golden_noise,
             num_warmup=args.num_warmup,
             num_test_runs=args.num_test_runs,
+            ts_logger=ts_logger,
         )
         pytorch_actions, pytorch_inference_stats, pytorch_model_stats = run_pytorch_inference(
             config,
@@ -675,6 +844,7 @@ def main():
             num_warmup=args.num_warmup,
             num_test_runs=args.num_test_runs,
             profile_eager=args.profile_eager,
+            ts_logger=ts_logger,
         )
 
         print("\n[4/4] Comparing results...")
@@ -733,6 +903,7 @@ def main():
             num_warmup=args.num_warmup,
             num_test_runs=args.num_test_runs,
             profile_eager=args.profile_eager,
+            ts_logger=ts_logger,
         )
 
         print("\n" + "=" * 60)
@@ -758,6 +929,7 @@ def main():
             example,
             num_warmup=args.num_warmup,
             num_test_runs=args.num_test_runs,
+            ts_logger=ts_logger,
         )
 
         print("\n" + "=" * 60)
