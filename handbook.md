@@ -92,6 +92,7 @@ sudo docker run --rm -it --runtime nvidia \
   -v "$PWD":/workspace \
   -v "$HOME/.cache/openpi":/root/.cache/openpi \
   -v "$HOME/.cache/huggingface":/root/.cache/huggingface \
+  -v /usr/bin/tegrastats:/usr/bin/tegrastats:ro \
   -w /workspace \
   openpi-pi0.5:l4t-jp7.2
 ```
@@ -262,6 +263,7 @@ python examples/libero/main.py \
 |---|---|
 | `ModuleNotFoundError: No module named 'openpi'` | 容器内未 `export PYTHONPATH=packages/openpi-client/src:src:.:$PYTHONPATH`（`collect_perf_data.sh` 已内置自愈，手工跑脚本时需自己 export） |
 | `Illegal --gpu-metrics-devices usage ... Insufficient privilege` | 容器缺权限，`docker run` 加 `--cap-add SYS_ADMIN` 重开 |
+| 没有生成 `*_emc.log` / 日志提示 `tegrastats not found` | 容器内没有 tegrastats 二进制（logger 会静默禁用）。`docker run` 加 `-v /usr/bin/tegrastats:/usr/bin/tegrastats:ro` 重开后重跑 |
 | nsys GPU metrics 里没有 DRAM 指标 | Tegra iGPU 的 DRAM 在 SoC 侧 EMC，不归 GPU metrics 采样——用 `--tegrastats-log`（本分支工具）或 NCU `dram__*` |
 | host 的 nsys 打不开 Thor 的 `.nsys-rep` | 版本前向不兼容；改读 `nsys stats` 同时导出的 `.sqlite`（标准 SQLite，跨版本可查），`analyze_perf.py` 已这么做 |
 | ptc/trt 的 `*_sum.csv` 是 0 字节 | 稳态计算在 CUDA graph replay 内，此 nsys 版本不归因 graph 内 kernel——预期行为，不是采集失败 |

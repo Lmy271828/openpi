@@ -11,7 +11,7 @@
 #   NUM_WARMUP=3              NUM_TEST_RUNS=10
 #
 # Each backend run is captured by two instruments from the same process:
-#   - nsys (--gpu-metrics-device=all): kernel times + SM/Tensor activity,
+#   - nsys (--gpu-metrics-devices=all): kernel times + SM/Tensor activity,
 #     i.e. compute-side occupancy per NVTX stage (see analyze_perf.py).
 #   - tegrastats (embedded via --tegrastats-log): EMC% (DRAM controller)
 #     and GR3D% per phase — the only DRAM bandwidth source on Thor, where
@@ -86,7 +86,7 @@ run_infer () {  # $1=output prefix, rest=extra args for pi05_inference_nvtx.py
     # so the per-phase EMC/GR3D table survives the tail on stdout.
     local tag="$1"; shift
     nsys profile -o "$OUT/$tag" --force-overwrite=true -t cuda,nvtx \
-        --gpu-metrics-device=all \
+        --gpu-metrics-devices=all \
         python deployment_scripts/pi05_inference_nvtx.py \
             --config-name "$CONFIG_NAME" \
             --checkpoint-dir "$CKPT" \
