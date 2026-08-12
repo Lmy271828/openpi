@@ -3,7 +3,7 @@
 
 Additive analysis script — reads ./perf_data/ (produced by
 deployment_scripts/collect_perf_data.sh on Thor) and prints Markdown tables
-for report.md:
+for the perf report:
 
   1. num_steps sweep linear decomposition (PyTorch backend)
   2. DRAM / memory-subsystem bandwidth from nsys GPU metrics
@@ -388,11 +388,12 @@ def section_dram(perf_dir, peak_gbps=None):
             rows.append(cells)
 
         # Precise prefill/expert split via the S2/S3 NVTX stage probes
-        # (pi05_inference_nvtx.py), replacing the old time-fraction estimate
-        # (handbook §4.3). Only possible when the capture has stage probes —
+        # (pi05_inference_nvtx.py), replacing the cruder time-fraction
+        # estimate (splitting the test window by measured prefill/expert
+        # time shares). Only possible when the capture has stage probes —
         # the monolithic TRT engine path has none and keeps the window-level
-        # stats above. Covers the §7.3 saturation metrics as well, so this
-        # table supersedes the manual GPU_METRICS slicing in the handbook.
+        # stats above. The phase table also covers the saturation metrics
+        # (SMs Active / SM Issue / Tensor Active).
         phase_rows = []
         if wins:
             prefill, expert = stage_ranges(con, *wins[len(wins) // 2])
