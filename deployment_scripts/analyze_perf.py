@@ -7,9 +7,11 @@ for the perf report:
 
   1. num_steps sweep linear decomposition (PyTorch backend)
   2. DRAM / memory-subsystem bandwidth from nsys GPU metrics
-  3. CUDA graph usage per steady-state inference
-  4. nsys GPU kernel summary, rolled up by kernel category (per run prefix)
-  5. trtexec per-layer profile rolled up by model stage (ViT / LLM / expert)
+  3. DRAM / EMC utilization from tegrastats logs (Thor)
+  4. CUDA graph usage per steady-state inference
+  5. steady-state memcpy/memset per inference (sqlite test window)
+  6. nsys GPU kernel summary, rolled up by kernel category (per run prefix)
+  7. trtexec per-layer profile rolled up by model stage (ViT / LLM / expert)
 
 Artifact prefixes encode the capture hyperparameters (see collect_perf_data.sh):
 pi05_<backend>[_<engine-tag>]_<config>_w<warmup>_r<runs>. Runs are discovered
@@ -443,6 +445,121 @@ def section_dram(perf_dir, peak_gbps=None):
     return "\n\n".join(out)
 
 
+def section_emc(perf_dir, peak_gbps=None):
+    """tegrastats EMC (DRAM controller) / GR3D utilization per run.
+
+    On Thor the DRAM counters live on the SoC-side MC/EMC and are not part of
+    the nsys GPU-metrics set, so tegrastats is the zero-privilege DRAM source.
+    Reads <prefix>_emc.log (raw samples). When <prefix>_emc.log.windows.json
+    exists (written by pi05_inference_nvtx.py's TegrastatsLogger once samples
+    parse), samples are attributed to warmup/inference phases by wall-clock
+    alignment: sample k ≈ t0 + k * interval.
+    """
+    import glob
+
+    emc_re = re.compile(r"EMC_FREQ\s+(\d+)%")
+    gr3d_re = re.compile(r"GR3D_FREQ\s+(\d+)%")
+    peak = peak_gbps or 273.0  # Thor driver-reported peak; same default as the logger
+    out = []
+    for path in sorted(glob.glob(os.path.join(perf_dir, "*_emc.log"))):
+        prefix = os.path.basename(path)[: -len("_emc.log")]
+        with open(path) as f:
+            lines = f.read().splitlines()
+        samples = [
+            (int(me.group(1)), int(mg.group(1)))
+            for line in lines
+            if (me := emc_re.search(line)) and (mg := gr3d_re.search(line))
+        ]
+        if not samples:
+            out.append(
+                f"**{prefix}** — {len(lines)} 行采样但零条 EMC/GR3D 字段：tegrastats 在容器内读不到 "
+                "sysfs 节点时会静默省略这两个字段。`docker run` 加 `-v /sys:/sys:ro` 后重采"
+                "（handbook Step 3）。"
+            )
+            continue
+
+        def row(name, seg):
+            if not seg:
+                return [name, 0, "-", "-", "-", "-", "-"]
+            se = [s[0] for s in seg]
+            sg = [s[1] for s in seg]
+            em = sum(se) / len(se)
+            return [name, len(seg), f"{em:.1f}", max(se), f"{em / 100 * peak:.0f}",
+                    f"{sum(sg) / len(sg):.1f}", max(sg)]
+
+        rows = []
+        win_path = path + ".windows.json"
+        if os.path.exists(win_path):
+            with open(win_path) as f:
+                win = json.load(f)
+            dt = win["interval_ms"] / 1000.0
+            t0 = win["t0_wallclock"]
+            for name, s, e in win["phases"]:
+                i0 = max(0, int(-(-(s - t0) // dt)))  # ceil without math import
+                i1 = min(len(samples), max(i0, int((e - t0) / dt)))
+                rows.append(row(name, samples[i0:i1]))
+        rows.append(row("overall", samples))
+        out.append(
+            f"**{prefix}**\n\n"
+            + md_table(["阶段", "样本数", "EMC% mean", "EMC% max", "DRAM GB/s ≈",
+                        "GR3D% mean", "GR3D% max"], rows)
+            + f"\n\n_DRAM GB/s ≈ EMC% mean × {peak:.0f} GB/s（Thor 峰值，驱动上报值）_"
+        )
+    if not out:
+        return "_未找到 *_emc.log（采集时加 --tegrastats-log，collect_perf_data.sh 已内置）_"
+    return "\n\n".join(out)
+
+
+def section_steady_memops(perf_dir):
+    """Memcpy/memset inside the median test window, from the nsys sqlite.
+
+    Unlike the *_cuda_gpu_mem_*_sum.csv totals (whole capture incl. warmup and
+    engine deserialization), this attributes memory traffic to one steady-state
+    inference. Graph-internal copies are still invisible to this nsys build,
+    so what shows up here is the non-graphed glue traffic.
+    """
+    # CUPTI_ACTIVITY_MEMCPY_TYPE_*
+    KIND = {0: "unknown", 1: "H2D", 2: "D2H", 3: "H2A", 4: "A2H", 5: "A2A",
+            6: "A2D", 7: "D2A", 8: "D2D", 9: "H2H", 10: "P2P"}
+    out = []
+    for prefix in discover_prefixes(perf_dir):
+        path = os.path.join(perf_dir, f"{prefix}.sqlite")
+        if not os.path.exists(path):
+            continue
+        import sqlite3
+
+        con = sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro", uri=True)
+        wins = test_windows(con)
+        if not wins:
+            con.close()
+            continue
+        t0, t1 = wins[len(wins) // 2]
+        try:
+            mems = con.execute(
+                "SELECT copyKind, COUNT(*), SUM(end-start)/1e6, SUM(bytes)/1e6 "
+                "FROM CUPTI_ACTIVITY_KIND_MEMCPY WHERE start>=? AND start<? "
+                "GROUP BY copyKind ORDER BY 3 DESC", (t0, t1)).fetchall()
+        except Exception:
+            mems = []
+        try:
+            ms_cnt, ms_ns = con.execute(
+                "SELECT COUNT(*), COALESCE(SUM(end-start),0) FROM CUPTI_ACTIVITY_KIND_MEMSET "
+                "WHERE start>=? AND start<?", (t0, t1)).fetchone()
+        except Exception:
+            ms_cnt, ms_ns = 0, 0
+        con.close()
+
+        rows = [[KIND.get(k, f"kind{k}"), c, f"{t:.2f}", f"{b:.1f}"] for k, c, t, b in mems]
+        if ms_cnt:
+            rows.append(["memset", ms_cnt, f"{ms_ns / 1e6:.2f}", "-"])
+        body = (md_table(["类型", "次数", "总耗时 (ms)", "总量 (MB)"], rows)
+                if rows else "_test 窗口内无 memcpy/memset_")
+        out.append(f"**{prefix}**（test_i 窗口 {(t1 - t0) / 1e6:.1f} ms）\n\n{body}")
+    if not out:
+        return "_未找到可用的 sqlite / test 窗口_"
+    return "\n\n".join(out)
+
+
 def section_graph_launches(perf_dir):
     """CUDA graph usage per steady-state inference, from the nsys sqlite exports.
 
@@ -499,7 +616,9 @@ def main():
     sections = [
         ("num_steps 扫描（PyTorch）", section_sweep(args.perf_dir)),
         ("DRAM / 显存带宽（GPU metrics）", section_dram(args.perf_dir, args.dram_peak_gbps)),
+        ("DRAM / EMC（tegrastats）", section_emc(args.perf_dir, args.dram_peak_gbps)),
         ("CUDA graph 使用情况（sqlite 直读）", section_graph_launches(args.perf_dir)),
+        ("稳态 MemOps（sqlite test 窗口）", section_steady_memops(args.perf_dir)),
     ]
     for prefix in discover_prefixes(args.perf_dir):
         sections.append((f"nsys kernel 分析 — {prefix}", section_nsys(args.perf_dir, prefix, prefix)))

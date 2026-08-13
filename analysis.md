@@ -60,6 +60,18 @@ TRT 采集不含 S2/S3 NVTX 探针（引擎内部不可标注），无法精确�
 - **pi05_ptcompile**（test_i 窗口 137.0 ms）：cudaGraphLaunch × **39**，普通 cudaLaunchKernel × 83，窗口内可见 kernel 仅 83 个 / 0.22 ms——稳态计算几乎全部在 CUDA graph replay 内（graph 内 kernel 不被此 nsys 版本归因）。
 - **pi05_trt_fp8_nvfp4**（test_i 窗口 49.9 ms）：cudaGraphLaunch × **1**，普通 cudaLaunchKernel × 23，窗口内可见 kernel 仅 23 个 / 0.08 ms——同上，整次推理被 1 个 graph 覆盖。
 
+## DRAM / EMC（tegrastats）
+
+两份 `*_emc.log` 均零条 EMC/GR3D 字段（容器未挂 `/sys`，tegrastats 静默省略字段，见结论 4 与排查记录）；analyze_perf.py 该小节已就绪，重采后自动输出分阶段 EMC%/GR3D% 表。
+
+## 稳态 MemOps（sqlite test 窗口）
+
+**pi05_ptcompile**（test_i 窗口 137.0 ms）：H2D 10 次 / 0.02 ms / 0.5 MB；D2D 18 次 / 0.03 ms；D2H 13 次 / 0.04 ms。
+
+**pi05_trt_fp8_nvfp4**（test_i 窗口 49.9 ms）：H2D 9 次 / 0.02 ms / 0.5 MB；D2D 9 次 / 0.01 ms / 0.9 MB；D2H 2 次 / 0.00 ms。
+
+——单次稳态推理 memcpy 合计 ~0.1 ms、≤1 MB（H2D 0.5 MB ≈ 3 路 224×224×3 输入）。CSV 全窗口里 PyTorch 的 36.4 GB D2D 全部来自 warmup/compile。
+
 ## nsys kernel 分析 — pi05_ptcompile（全采集窗口，含 warmup）
 
 GPU kernel 总耗时 11283.40 ms（**绝大部分在 warmup/compile 阶段**，稳态见 CUDA graph 一节）。
@@ -119,6 +131,7 @@ NVFP4 动态量化开销（`*Dyna*` 类算子）：69 个，合计 6.23 ms（10.
 # 结论
 
 **1. 端到端：TRT 比 PyTorch(torch.compile) 快 2.74×。** sqlite 直读的稳态 test 窗口：TRT 49.9 ms vs PyTorch 137.0 ms。两后端稳态计算都完整包在 CUDA graph 内（TRT 整次推理仅 1 次 cudaGraphLaunch；PyTorch 39 次），此前 kern_sum 的 11283 ms 几乎全是 warmup/compile 痕迹，不能用于对比。
+注意：本次 ptcompile 窗口被 NVTX 探针轻微污染——`_make_denoise_step` 的可变全局计数器导致 dynamo 每步重编译、触发 recompile_limit(8) 后 idx≥8 的步回退 eager（console.log 有记录）；137.0 ms 比干净的 sweep T(10)=131.9 ms 高 ~4% 即源于此。已在 `pi05_inference_nvtx.py` 给探针加 `@torch._dynamo.disable` 修复，重采后该窗口应与 sweep 对齐。
 
 **2. PyTorch 侧 kernel 总量是 warmup 假象。** 85%（9624 ms / 74072 次）是 `FillFunctor<int>`——int32 填充，来自 compile/warmup 阶段反复建 mask / position id，稳态窗口内不存在（稳态可见 kernel 仅 0.22 ms）。对比分析应完全基于 test 窗口数据。
 
@@ -128,11 +141,10 @@ NVFP4 动态量化开销（`*Dyna*` 类算子）：69 个，合计 6.23 ms（10.
 
 **5. TRT 内部可再挖 ~10%。** NVFP4 动态量化（`*Dyna*`）69 个算子共 6.23 ms（10.2%），是激活动态 scale 计算；改校准后静态 scale 或与相邻算子融合可回收大部分。阶段占比：expert x10 = 51.7%、LLM prefill = 37.8%、ViT = 10.5%；层级流水重叠窗口 3.16 ms/step，10 步理论上限 ~31 ms（约为总时延一半），但需先断开 LLM 层间与 expert 的依赖。
 
-**6. 访存流量（PyTorch，全窗口）**：D2D 36.4 GB / 402.7 ms ≈ 90 GB/s（峰值 273 的 1/3），H2D 8.9 GB。其中 warmup 占比待 sqlite 切窗确认；若稳态有显著 D2D（KV cache / 拼接），是 PyTorch 路径除 GEMM 外最值得追的一项。
+**6. 访存流量只是 warmup 假象（已由 sqlite 切窗证实）。** 全窗口 CSV 里 PyTorch 有 D2D 36.4 GB / 402.7 ms、H2D 8.9 GB，但按 test 窗口过滤后，单次稳态推理的 memcpy 合计仅 **~0.1 ms / ≤1 MB**（H2D 0.5 MB ≈ 3 路 224×224×3 输入图像，符合预期；D2D/D2H 为微量 glue）。两个后端皆然——稳态访存不是优化对象，GPU 时间几乎全在计算上。
 
 ## 后续行动
 
-- [ ] **重采 tegrastats**：`*_emc.log` 零 EMC/GR3D 样本的根因已查明——容器只挂了 tegrastats 二进制、没挂 `/sys`，tegrastats 读不到 sysfs 节点时静默省略字段。`docker run` 加 `-v /sys:/sys:ro`（handbook Step 3 已更新）后重跑 `collect_perf_data.sh`，再给 analyze_perf.py 加 EMC 解析小节
-- [ ] 用 sqlite 按 test 窗口过滤 MemOps，确认稳态 D2D/H2D 的真实占比
+- [ ] **重采 tegrastats**（根因已查明：容器只挂了 tegrastats 二进制、没挂 `/sys`，tegrastats 读不到 sysfs 节点时静默省略 EMC/GR3D 字段）。`docker run` 加 `-v /sys:/sys:ro`（handbook Step 3 已更新）后重跑 `collect_perf_data.sh`；analyze_perf.py 的「DRAM / EMC（tegrastats）」小节已就绪，会自动按 phase 对齐输出
 - [ ] TRT：评估 NVFP4 静态 scale / Dyna 算子融合（预期省 ~5-6 ms/次）
 - [ ] 评估 LLM 层与 expert denoise 的层级流水（重叠窗口 3.16 ms/step）

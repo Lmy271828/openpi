@@ -172,5 +172,5 @@ cython_debug/
 *.sqlite
 *.engine
 
-# Redundant archive of deployment_scripts/
-deployment_scripts.zip
+
+

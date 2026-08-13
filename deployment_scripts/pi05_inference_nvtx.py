@@ -217,6 +217,15 @@ def _make_pwe_forward(fn):
 
 
 def _make_denoise_step(fn):
+    # torch._dynamo.disable is load-bearing: the compiled sample_actions traces
+    # into this wrapper, and the guard on the mutable global _NVTX["denoise_idx"]
+    # forces one recompile per step index — with num_steps=10 that exceeds
+    # config.recompile_limit (8), after which denoise_step silently falls back
+    # to EAGER for the remaining steps and pollutes the ptcompile measurement
+    # (observed as "hit config.recompile_limit (8)" in the console log).
+    # Disabled wrappers run outside the compiled region: the NVTX range still
+    # brackets the call, and fn itself is compiled as its own graph.
+    @torch._dynamo.disable
     def denoise_step(*args, **kwargs):
         i = _NVTX["denoise_idx"]
         _NVTX["denoise_idx"] = i + 1

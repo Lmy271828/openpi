@@ -83,7 +83,8 @@ run_stats () {  # $1=rep path, $2=output prefix
 run_infer () {  # $1=output prefix, rest=extra args for pi05_inference_nvtx.py
     # One process, two instruments: nsys for compute-side metrics, embedded
     # tegrastats for DRAM/EMC. Full console output is tee'd to <prefix>_console.log
-    # so the per-phase EMC/GR3D table survives the tail on stdout.
+    # (and streamed live — do NOT re-add a `| tail -N`: it buffers everything
+    # until process exit and makes the run look hung).
     local tag="$1"; shift
     nsys profile -o "$OUT/$tag" --force-overwrite=true -t cuda,nvtx \
         --gpu-metrics-devices=all \
@@ -93,7 +94,7 @@ run_infer () {  # $1=output prefix, rest=extra args for pi05_inference_nvtx.py
             --num-warmup "$NUM_WARMUP" --num-test-runs "$NUM_TEST_RUNS" \
             --tegrastats-log "$OUT/${tag}_emc.log" \
             "$@" \
-        2>&1 | tee "$OUT/${tag}_console.log" | tail -20
+        2>&1 | tee "$OUT/${tag}_console.log"
     run_stats "$OUT/$tag.nsys-rep" "$OUT/$tag"
 }
 
