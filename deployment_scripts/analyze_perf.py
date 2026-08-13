@@ -452,10 +452,18 @@ def section_emc(perf_dir, peak_gbps=None):
     the nsys GPU-metrics set, so tegrastats is the zero-privilege DRAM source.
     Reads <prefix>_emc.log (raw samples). When <prefix>_emc.log.windows.json
     exists (written by pi05_inference_nvtx.py's TegrastatsLogger once samples
-    parse), samples are attributed to warmup/inference phases by wall-clock
-    alignment: sample k ≈ t0 + k * interval.
+    parse), samples are attributed to warmup/inference phases.
+
+    Phase alignment uses the per-line timestamps GB10y tegrastats emits
+    ("MM-DD-YYYY HH:MM:SS ..."), taken RELATIVE to the first sample so the
+    host's timezone never enters the computation. The old index-based scheme
+    (sample k ≈ t0 + k*interval) drifts badly: GB10y tegrastats sustains only
+    ~8 Hz at a nominal 100 ms interval, i.e. ~20 s of accumulated error over
+    a 110 s run — enough to map the test phase past the last sample. Falls
+    back to the index scheme for logs without timestamps.
     """
     import glob
+    from datetime import datetime
 
     emc_re = re.compile(r"EMC_FREQ\s+(\d+)%")
     # GB10y/JP7.2 tegrastats emits GR3D without a utilization %:
@@ -464,30 +472,39 @@ def section_emc(perf_dir, peak_gbps=None):
     # of EMC (requiring both on one line silently drops every sample).
     gr3d_pct_re = re.compile(r"GR3D_FREQ\s+(\d+)%")
     gr3d_mhz_re = re.compile(r"GR3D_FREQ\s+@?\[([\d,\s]+)\]")
+    ts_re = re.compile(r"^(\d{2}-\d{2}-\d{4} \d{2}:\d{2}:\d{2})")
     peak = peak_gbps or 273.0  # Thor driver-reported peak; same default as the logger
     out = []
     for path in sorted(glob.glob(os.path.join(perf_dir, "*_emc.log"))):
         prefix = os.path.basename(path)[: -len("_emc.log")]
         with open(path) as f:
             lines = f.read().splitlines()
-        samples = []  # (emc_pct, gr3d_value) per line; gr3d in % or MHz (mode below)
+        samples = []  # (rel_s or None, emc_pct, gr3d_value); rel_s = seconds since first sample
         gr3d_mode = None
+        first_dt = None
         for line in lines:
             me = emc_re.search(line)
+            if me is None:
+                continue
             mg = gr3d_pct_re.search(line)
             mf = gr3d_mhz_re.search(line)
             if mg:
                 gr3d_mode = gr3d_mode or "pct"
-            if me is None:
-                continue
-            if mg:
-                samples.append((int(me.group(1)), int(mg.group(1))))
+                g = float(mg.group(1))
             elif mf:
                 gr3d_mode = gr3d_mode or "mhz"
                 freqs = [int(x) for x in mf.group(1).split(",") if x.strip()]
-                samples.append((int(me.group(1)), sum(freqs) / len(freqs) if freqs else None))
+                g = sum(freqs) / len(freqs) if freqs else None
             else:
-                samples.append((int(me.group(1)), None))
+                g = None
+            rel = None
+            mt = ts_re.match(line)
+            if mt:
+                dt = datetime.strptime(mt.group(1), "%m-%d-%Y %H:%M:%S")
+                if first_dt is None:
+                    first_dt = dt
+                rel = (dt - first_dt).total_seconds()  # TZ cancels in the difference
+            samples.append((rel, int(me.group(1)), g))
         if not samples:
             out.append(
                 f"**{prefix}** — {len(lines)} 行采样但解析不到 EMC_FREQ："
@@ -501,8 +518,8 @@ def section_emc(perf_dir, peak_gbps=None):
         def row(name, seg):
             if not seg:
                 return [name, 0, "-", "-", "-", "-", "-"]
-            se = [s[0] for s in seg]
-            sg = [s[1] for s in seg if s[1] is not None]
+            se = [s[1] for s in seg]
+            sg = [s[2] for s in seg if s[2] is not None]
             em = sum(se) / len(se)
             return [name, len(seg), f"{em:.1f}", max(se), f"{em / 100 * peak:.0f}",
                     f"{sum(sg) / len(sg):.1f}" if sg else "-", f"{max(sg):.0f}" if sg else "-"]
@@ -512,12 +529,17 @@ def section_emc(perf_dir, peak_gbps=None):
         if os.path.exists(win_path):
             with open(win_path) as f:
                 win = json.load(f)
-            dt = win["interval_ms"] / 1000.0
             t0 = win["t0_wallclock"]
+            use_ts = all(s[0] is not None for s in samples)
             for name, s, e in win["phases"]:
-                i0 = max(0, int(-(-(s - t0) // dt)))  # ceil without math import
-                i1 = min(len(samples), max(i0, int((e - t0) / dt)))
-                rows.append(row(name, samples[i0:i1]))
+                if use_ts:
+                    seg = [smp for smp in samples if (s - t0) <= smp[0] < (e - t0)]
+                else:
+                    dt = win["interval_ms"] / 1000.0
+                    i0 = max(0, int(-(-(s - t0) // dt)))  # ceil without math import
+                    i1 = min(len(samples), max(i0, int((e - t0) / dt)))
+                    seg = samples[i0:i1]
+                rows.append(row(name, seg))
         rows.append(row("overall", samples))
         out.append(
             f"**{prefix}**\n\n"

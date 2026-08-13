@@ -46,6 +46,7 @@ import re
 import shutil
 import subprocess
 import time
+from datetime import datetime
 
 import numpy as np
 import nvtx
@@ -87,6 +88,7 @@ class TegrastatsLogger:
     # GB10y/JP7.2 tegrastats: GR3D_FREQ has no utilization %, only per-engine
     # MHz — "GR3D_FREQ @[1574,1574,1574]". Fall back to mean MHz then.
     _GR3D_MHZ_RE = re.compile(r"GR3D_FREQ\s+@?\[([\d,\s]+)\]")
+    _TS_RE = re.compile(r"^(\d{2}-\d{2}-\d{4} \d{2}:\d{2}:\d{2})")
 
     def __init__(self, log_path, interval_ms=100, peak_gbps=273.0):
         self.log_path = log_path
@@ -129,8 +131,9 @@ class TegrastatsLogger:
             return
         with open(self.log_path) as f:
             lines = f.read().splitlines()
-        samples = []  # (emc_pct, gr3d) per line; gr3d is % or mean MHz (build-dependent)
+        samples = []  # (rel_s or None, emc_pct, gr3d); gr3d is % or mean MHz (build-dependent)
         gr3d_mhz = False
+        first_dt = None
         for line in lines:
             me = self._EMC_RE.search(line)
             if not me:
@@ -145,7 +148,18 @@ class TegrastatsLogger:
                 freqs = [int(x) for x in mf.group(1).split(",") if x.strip()]
                 g = sum(freqs) / len(freqs) if freqs else 0.0
                 gr3d_mhz = True
-            samples.append((int(me.group(1)), g))
+            # GB10y tegrastats prefixes each line with "MM-DD-YYYY HH:MM:SS".
+            # Use it (relative to the first sample, so timezone cancels): the
+            # real cadence (~8 Hz at a nominal 100 ms interval) drifts ~20 s
+            # over a run, making index-based phase alignment unusable.
+            rel = None
+            mt = self._TS_RE.match(line)
+            if mt:
+                dt = datetime.strptime(mt.group(1), "%m-%d-%Y %H:%M:%S")
+                if first_dt is None:
+                    first_dt = dt
+                rel = (dt - first_dt).total_seconds()
+            samples.append((rel, int(me.group(1)), g))
         if not samples:
             print("  [tegrastats] no EMC/GR3D samples parsed from log")
             return
@@ -165,8 +179,8 @@ class TegrastatsLogger:
         def row(name, seg):
             if not seg:
                 return (name, 0, "-", "-", "-", "-", "-")
-            se = [s[0] for s in seg]
-            sg = [s[1] for s in seg]
+            se = [s[1] for s in seg]
+            sg = [s[2] for s in seg]
             emc_mean = sum(se) / len(se)
             return (
                 name,
@@ -175,10 +189,14 @@ class TegrastatsLogger:
                 f"{max(se)}",
                 f"{emc_mean / 100 * self.peak_gbps:.0f}",
                 f"{sum(sg) / len(sg):.1f}",
-                f"{max(sg)}",
+                f"{max(sg):.0f}",
             )
 
+        use_ts = all(s[0] is not None for s in samples)
+
         def phase_seg(s, e):
+            if use_ts:
+                return [smp for smp in samples if (s - self.t0) <= smp[0] < (e - self.t0)]
             i0 = max(0, math.ceil((s - self.t0) / self.dt))
             i1 = min(len(samples), max(i0, int((e - self.t0) / self.dt)))
             return samples[i0:i1]
@@ -188,9 +206,9 @@ class TegrastatsLogger:
 
         print(f"\n== tegrastats — {title} ({len(samples)} samples @ {int(self.dt * 1000)} ms, log: {self.log_path}) ==")
         gu = "GR3D MHz" if gr3d_mhz else "GR3D%"
-        print(f"{'phase':<16}{'samples':>8}{'EMC% mean':>10}{'EMC% max':>9}{'DRAM GB/s':>10}{gu + ' mean':>13}{gu + ' max':>12}")
+        print(f"{'phase':<16}{'samples':>8}{'EMC% mean':>10}{'EMC% max':>9}{'DRAM GB/s':>11}{gu + ' mean':>14}{gu + ' max':>13}")
         for r in rows:
-            print(f"{r[0]:<16}{r[1]:>8}{r[2]:>10}{r[3]:>9}{r[4]:>10}{r[5]:>11}{r[6]:>10}")
+            print(f"{r[0]:<16}{r[1]:>8}{r[2]:>10}{r[3]:>9}{r[4]:>11}{r[5]:>14}{r[6]:>13}")
         print(f"  DRAM GB/s ≈ EMC% mean × {self.peak_gbps:.0f} GB/s（Thor 峰值，驱动上报值）")
 
 
