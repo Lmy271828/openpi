@@ -20,11 +20,12 @@ if str(_deployment_scripts_dir) not in sys.path:
     sys.path.insert(0, str(_deployment_scripts_dir))
 
 try:
-    from deployment_scripts.trt_model_forward import setup_pi0_tensorrt_engine
+    from deployment_scripts.trt_model_forward import install_attention_mask_dtype_fix, setup_pi0_tensorrt_engine
 
     TENSORRT_AVAILABLE = True
 except ImportError:
     TENSORRT_AVAILABLE = False
+    install_attention_mask_dtype_fix = None
     logging.warning("TensorRT support not available. Install TensorRT to enable acceleration.")
 
 
@@ -121,6 +122,21 @@ def create_policy(args: Args) -> _policy.Policy:
 def main(args: Args) -> None:
     policy = create_policy(args)
     policy_metadata = policy.metadata
+
+    # PyTorch path: the additive attention mask is built in fp32 while attention
+    # computes in bf16; torch.compile'd SDPA then raises "invalid dtype for bias
+    # - should match query's dtype" on the first infer. Same deployment-side fix
+    # the perf harness (pi05_inference_nvtx.py) installs. Must run BEFORE the
+    # first inference so torch.compile traces the patched mask builder.
+    model = getattr(policy, "_model", None) or getattr(policy, "model", None)
+    if model is not None and hasattr(model, "paligemma_with_expert"):
+        if install_attention_mask_dtype_fix is not None:
+            install_attention_mask_dtype_fix(model)
+        else:
+            logging.warning(
+                "deployment_scripts.trt_model_forward not importable; PyTorch serving will fail "
+                "with 'invalid dtype for bias' once torch.compile picks the memory-efficient SDPA kernel."
+            )
 
     # Setup TensorRT acceleration if requested
     if args.use_tensorrt:
