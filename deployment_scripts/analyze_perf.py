@@ -201,7 +201,7 @@ def section_nsys(perf_dir, prefix, label):
         lines.append(md_table(
             ["操作", "总耗时 (ms)", "次数"],
             [[col(r, "Name", "Operation"), fmt_ms(float(col(r, "Total Time (ns)", "Total Time") or 0)),
-              col(r, "Instances")] for r in mem],
+              col(r, "Instances", "Count")] for r in mem],
         ))
     return "\n".join(lines)
 

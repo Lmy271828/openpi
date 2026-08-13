@@ -93,6 +93,7 @@ sudo docker run --rm -it --runtime nvidia \
   -v "$HOME/.cache/openpi":/root/.cache/openpi \
   -v "$HOME/.cache/huggingface":/root/.cache/huggingface \
   -v /usr/bin/tegrastats:/usr/bin/tegrastats:ro \
+  -v /sys:/sys:ro \
   -w /workspace \
   openpi-pi0.5:l4t-jp7.2
 ```
@@ -102,6 +103,9 @@ sudo docker run --rm -it --runtime nvidia \
 - `--cap-add SYS_ADMIN`：GPU metrics 采样（Step 4 的 DRAM/SM 饱和度观测）需要，不加会被
   nsys 拒绝（`Illegal --gpu-metrics-devices usage ... Insufficient privilege`）
 - `--network host`：替代 `-p 8000:8000`，同时方便 policy server 与 tegrastats 时间对齐
+- `-v /sys:/sys:ro`：tegrastats 的 EMC_FREQ/GR3D_FREQ 读自 sysfs 节点，只挂二进制不够——
+  读不到时 tegrastats 会静默省略这两个字段（`*_emc.log` 有采样行但没有 EMC/GR3D 数据）。
+  必须把整个 `/sys` 挂进容器（NVIDIA 官方确认，forums.developer.nvidia.com/t/311539）
 - `.cache` 两个挂载务必保留：checkpoint（~6 GB）、HF 数据集、ONNX/引擎全部落在里面，
   容器是 `--rm` 的，不挂载则每次重来
 
@@ -179,11 +183,11 @@ python deployment_scripts/pi05_inference_nvtx.py \
 > 判读参考：EMC% 稳态 >80% 才是带宽瓶颈；本模型两阶段 SM Issue 仅 ~9–20%，
 > 属内存**延迟**受限而非带宽饱和（优化方向是 graph/融合/流水，不是继续压精度）。
 
-拷回 host（只传结论层，原始 `.nsys-rep`/`.sqlite` 留 Thor，需要深挖再单独拉）：
+拷回 host：
 
 ```bash
 # host 上执行
-scp hcclab@<THOR_IP>:~/lmy/openpi/perf_data/*.{csv,json,log} perf_data/
+scp hcclab@<THOR_IP>:~/lmy/openpi/perf_data/* perf_data/
 ```
 
 ---
@@ -214,13 +218,16 @@ python deployment_scripts/analyze_perf.py --perf-dir perf_data --dram-peak-gbps 
 
 LIBERO-Long 即 `libero_10` 任务套件。三臂对照以分离"TRT 转换误差"与"量化误差"：
 
+```bash
+export CKPT=~/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch
+```
+
 | 臂 | server 启动命令（Thor 容器内） | 作用 |
 |---|---|---|
-| A | `python scripts/serve_policy.py policy:checkpoint --policy.config=pi05_libero --policy.dir=$CKPT --port 8000` | PyTorch BF16 基准 |
+| A | `python scripts/serve_policy.py --port 8000 policy:checkpoint --policy.config=${CONFIG_NAME} --policy.dir=$CKPT` | PyTorch BF16 基准 |
 | B | A + `--use-tensorrt --tensorrt-engine $CKPT/engine/model_fp16.engine`（需另建 fp16 引擎，可选） | 隔离转换误差 |
 | C | A + `--use-tensorrt --tensorrt-engine $CKPT/engine/model_fp8_nvfp4.engine` | 量化总掉点 |
 
-`$CKPT=~/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch`
 
 client（x86 仿真机，需先按 `examples/libero/README.md` 装好 LIBERO 环境）：
 
@@ -264,6 +271,7 @@ python examples/libero/main.py \
 | `ModuleNotFoundError: No module named 'openpi'` | 容器内未 `export PYTHONPATH=packages/openpi-client/src:src:.:$PYTHONPATH`（`collect_perf_data.sh` 已内置自愈，手工跑脚本时需自己 export） |
 | `Illegal --gpu-metrics-devices usage ... Insufficient privilege` | 容器缺权限，`docker run` 加 `--cap-add SYS_ADMIN` 重开 |
 | 没有生成 `*_emc.log` / 日志提示 `tegrastats not found` | 容器内没有 tegrastats 二进制（logger 会静默禁用）。`docker run` 加 `-v /usr/bin/tegrastats:/usr/bin/tegrastats:ro` 重开后重跑 |
+| `*_emc.log` 有采样行但无 EMC_FREQ/GR3D_FREQ 字段 | 容器只挂了 tegrastats 二进制没挂 `/sys`，tegrastats 读不到 sysfs 节点时静默省略字段。`docker run` 加 `-v /sys:/sys:ro` 重开后重跑 |
 | nsys GPU metrics 里没有 DRAM 指标 | Tegra iGPU 的 DRAM 在 SoC 侧 EMC，不归 GPU metrics 采样——用 `--tegrastats-log`（本分支工具）或 NCU `dram__*` |
 | host 的 nsys 打不开 Thor 的 `.nsys-rep` | 版本前向不兼容；改读 `nsys stats` 同时导出的 `.sqlite`（标准 SQLite，跨版本可查），`analyze_perf.py` 已这么做 |
 | ptc/trt 的 `*_sum.csv` 是 0 字节 | 稳态计算在 CUDA graph replay 内，此 nsys 版本不归因 graph 内 kernel——预期行为，不是采集失败 |
