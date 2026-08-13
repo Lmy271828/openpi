@@ -364,8 +364,8 @@ def section_dram(perf_dir, peak_gbps=None):
             dram = [(mid, name) for mid, name in catalog
                     if re.search(r"copy engine active.*throughput", name, re.I)]
             note = ("nsys GPU metrics 在本设备（Tegra iGPU）未暴露 DRAM 计数器——DRAM 挂在 SoC 侧 "
-                    "MC/EMC，不归 GPU metrics 采样；以下为 Copy Engine 吞吐作为显存传输代理。"
-                    "真实 DRAM 带宽请用 tegrastats（EMC%）或 NCU dram__* 指标。")
+                    "MC/EMC，不归 GPU metrics 采样（设备限制，重采不会改变）；以下为 Copy Engine 吞吐，"
+                    "仅作显存传输代理。真实 DRAM 带宽见「DRAM / EMC（tegrastats）」一节。")
         else:
             note = None
 

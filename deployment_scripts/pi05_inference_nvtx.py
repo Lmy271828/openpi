@@ -103,7 +103,10 @@ class TegrastatsLogger:
             return
         self._fh = open(self.log_path, "w")
         self.proc = subprocess.Popen(
-            ["tegrastats", "--interval", str(int(self.dt * 1000))],
+            # stdbuf -oL: tegrastats block-buffers (~8 KB ≈ 1.8 s of samples)
+            # when stdout is a file, and terminate() would silently drop the
+            # tail — exactly the inference_test phase. Line-buffer it instead.
+            ["stdbuf", "-oL", "tegrastats", "--interval", str(int(self.dt * 1000))],
             stdout=self._fh,
             stderr=subprocess.DEVNULL,
         )
