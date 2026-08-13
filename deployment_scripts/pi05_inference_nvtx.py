@@ -84,6 +84,9 @@ class TegrastatsLogger:
 
     _EMC_RE = re.compile(r"EMC_FREQ\s+(\d+)%")
     _GR3D_RE = re.compile(r"GR3D_FREQ\s+(\d+)%")
+    # GB10y/JP7.2 tegrastats: GR3D_FREQ has no utilization %, only per-engine
+    # MHz — "GR3D_FREQ @[1574,1574,1574]". Fall back to mean MHz then.
+    _GR3D_MHZ_RE = re.compile(r"GR3D_FREQ\s+@?\[([\d,\s]+)\]")
 
     def __init__(self, log_path, interval_ms=100, peak_gbps=273.0):
         self.log_path = log_path
@@ -123,11 +126,23 @@ class TegrastatsLogger:
             return
         with open(self.log_path) as f:
             lines = f.read().splitlines()
-        samples = [
-            (int(me.group(1)), int(mg.group(1)))
-            for line in lines
-            if (me := self._EMC_RE.search(line)) and (mg := self._GR3D_RE.search(line))
-        ]
+        samples = []  # (emc_pct, gr3d) per line; gr3d is % or mean MHz (build-dependent)
+        gr3d_mhz = False
+        for line in lines:
+            me = self._EMC_RE.search(line)
+            if not me:
+                continue
+            mg = self._GR3D_RE.search(line)
+            if mg:
+                g = float(mg.group(1))
+            else:
+                mf = self._GR3D_MHZ_RE.search(line)
+                if not mf:
+                    continue
+                freqs = [int(x) for x in mf.group(1).split(",") if x.strip()]
+                g = sum(freqs) / len(freqs) if freqs else 0.0
+                gr3d_mhz = True
+            samples.append((int(me.group(1)), g))
         if not samples:
             print("  [tegrastats] no EMC/GR3D samples parsed from log")
             return
@@ -169,7 +184,8 @@ class TegrastatsLogger:
         rows.append(row("overall", samples))
 
         print(f"\n== tegrastats — {title} ({len(samples)} samples @ {int(self.dt * 1000)} ms, log: {self.log_path}) ==")
-        print(f"{'phase':<16}{'samples':>8}{'EMC% mean':>10}{'EMC% max':>9}{'DRAM GB/s':>10}{'GR3D% mean':>11}{'GR3D% max':>10}")
+        gu = "GR3D MHz" if gr3d_mhz else "GR3D%"
+        print(f"{'phase':<16}{'samples':>8}{'EMC% mean':>10}{'EMC% max':>9}{'DRAM GB/s':>10}{gu + ' mean':>13}{gu + ' max':>12}")
         for r in rows:
             print(f"{r[0]:<16}{r[1]:>8}{r[2]:>10}{r[3]:>9}{r[4]:>10}{r[5]:>11}{r[6]:>10}")
         print(f"  DRAM GB/s ≈ EMC% mean × {self.peak_gbps:.0f} GB/s（Thor 峰值，驱动上报值）")
@@ -217,15 +233,17 @@ def _make_pwe_forward(fn):
 
 
 def _make_denoise_step(fn):
-    # torch._dynamo.disable is load-bearing: the compiled sample_actions traces
-    # into this wrapper, and the guard on the mutable global _NVTX["denoise_idx"]
-    # forces one recompile per step index — with num_steps=10 that exceeds
-    # config.recompile_limit (8), after which denoise_step silently falls back
-    # to EAGER for the remaining steps and pollutes the ptcompile measurement
-    # (observed as "hit config.recompile_limit (8)" in the console log).
-    # Disabled wrappers run outside the compiled region: the NVTX range still
-    # brackets the call, and fn itself is compiled as its own graph.
-    @torch._dynamo.disable
+    # The per-step tag reads a mutable global, so dynamo guards on its value and
+    # recompiles denoise_step once per step index. With num_steps=10 that exceeds
+    # the default recompile_limit (8), after which the remaining steps silently
+    # run EAGER (observed: "hit config.recompile_limit (8)" in the console log,
+    # +4% on the ptcompile test window). Raising the limit lets all variants
+    # compile during warmup, so steady state stays fully compiled AND graphed.
+    # Do NOT use torch._dynamo.disable on this wrapper instead: the graph breaks
+    # evict most kernels from CUDA graphs — measured 137 -> 274 ms on the
+    # ptcompile test window (graph launches 39 -> 9, exposed kernels 83 -> 11k).
+    torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
+
     def denoise_step(*args, **kwargs):
         i = _NVTX["denoise_idx"]
         _NVTX["denoise_idx"] = i + 1

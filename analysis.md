@@ -131,7 +131,7 @@ NVFP4 动态量化开销（`*Dyna*` 类算子）：69 个，合计 6.23 ms（10.
 # 结论
 
 **1. 端到端：TRT 比 PyTorch(torch.compile) 快 2.74×。** sqlite 直读的稳态 test 窗口：TRT 49.9 ms vs PyTorch 137.0 ms。两后端稳态计算都完整包在 CUDA graph 内（TRT 整次推理仅 1 次 cudaGraphLaunch；PyTorch 39 次），此前 kern_sum 的 11283 ms 几乎全是 warmup/compile 痕迹，不能用于对比。
-注意：本次 ptcompile 窗口被 NVTX 探针轻微污染——`_make_denoise_step` 的可变全局计数器导致 dynamo 每步重编译、触发 recompile_limit(8) 后 idx≥8 的步回退 eager（console.log 有记录）；137.0 ms 比干净的 sweep T(10)=131.9 ms 高 ~4% 即源于此。已在 `pi05_inference_nvtx.py` 给探针加 `@torch._dynamo.disable` 修复，重采后该窗口应与 sweep 对齐。
+注意：本次 ptcompile 窗口被 NVTX 探针轻微污染——`_make_denoise_step` 的可变全局计数器导致 dynamo 每步重编译、触发 recompile_limit(8) 后 idx≥8 的步回退 eager（console.log 有记录）；137.0 ms 比干净的 sweep T(10)=131.9 ms 高 ~4% 即源于此。修复走弯路记录：先加 `@torch._dynamo.disable` → graph break 把大量 kernel 挤出 CUDA graph，窗口恶化到 274 ms（graphLaunch 39→9、窗口内裸露 kernel 83→11142），该轮采集作废；正确修复是**提高 `torch._dynamo.config.recompile_limit` 到 64**，让 10 个步数变体在 warmup 全部编译完，稳态既保留逐步 NVTX 标签又不丢 graph（`pi05_inference_nvtx.py` 已改，需重采验证）。
 
 **2. PyTorch 侧 kernel 总量是 warmup 假象。** 85%（9624 ms / 74072 次）是 `FillFunctor<int>`——int32 填充，来自 compile/warmup 阶段反复建 mask / position id，稳态窗口内不存在（稳态可见 kernel 仅 0.22 ms）。对比分析应完全基于 test 窗口数据。
 
@@ -145,6 +145,6 @@ NVFP4 动态量化开销（`*Dyna*` 类算子）：69 个，合计 6.23 ms（10.
 
 ## 后续行动
 
-- [ ] **重采 tegrastats**（根因已查明：容器只挂了 tegrastats 二进制、没挂 `/sys`，tegrastats 读不到 sysfs 节点时静默省略 EMC/GR3D 字段）。`docker run` 加 `-v /sys:/sys:ro`（handbook Step 3 已更新）后重跑 `collect_perf_data.sh`；analyze_perf.py 的「DRAM / EMC（tegrastats）」小节已就绪，会自动按 phase 对齐输出
+- [ ] **重采 + 补拷**：① ptcompile 需用修好 recompile_limit 的 `pi05_inference_nvtx.py` 重跑（274 ms 那轮作废）；② TRT 的 `.nsys-rep`/CSV/sqlite 在 host 侧还是早上旧版，需从 Thor 补拷；③ tegrastats 已通（EMC% 有数据），重采时 logger 会写出 `.windows.json`，analyze 的 EMC 小节即可分阶段。首次 EMC 读数：overall 均值 11.3% ≈ 31 GB/s（含 idle，分阶段数据待重采）
 - [ ] TRT：评估 NVFP4 静态 scale / Dyna 算子融合（预期省 ~5-6 ms/次）
 - [ ] 评估 LLM 层与 expert denoise 的层级流水（重叠窗口 3.16 ms/step）

@@ -458,34 +458,54 @@ def section_emc(perf_dir, peak_gbps=None):
     import glob
 
     emc_re = re.compile(r"EMC_FREQ\s+(\d+)%")
-    gr3d_re = re.compile(r"GR3D_FREQ\s+(\d+)%")
+    # GB10y/JP7.2 tegrastats emits GR3D without a utilization %:
+    #   GR3D_FREQ @[1574,1574,1574]      (per-engine MHz only)
+    # older JetPack: GR3D_FREQ 12%@[1305,1305]. Handle both, independently
+    # of EMC (requiring both on one line silently drops every sample).
+    gr3d_pct_re = re.compile(r"GR3D_FREQ\s+(\d+)%")
+    gr3d_mhz_re = re.compile(r"GR3D_FREQ\s+@?\[([\d,\s]+)\]")
     peak = peak_gbps or 273.0  # Thor driver-reported peak; same default as the logger
     out = []
     for path in sorted(glob.glob(os.path.join(perf_dir, "*_emc.log"))):
         prefix = os.path.basename(path)[: -len("_emc.log")]
         with open(path) as f:
             lines = f.read().splitlines()
-        samples = [
-            (int(me.group(1)), int(mg.group(1)))
-            for line in lines
-            if (me := emc_re.search(line)) and (mg := gr3d_re.search(line))
-        ]
+        samples = []  # (emc_pct, gr3d_value) per line; gr3d in % or MHz (mode below)
+        gr3d_mode = None
+        for line in lines:
+            me = emc_re.search(line)
+            mg = gr3d_pct_re.search(line)
+            mf = gr3d_mhz_re.search(line)
+            if mg:
+                gr3d_mode = gr3d_mode or "pct"
+            if me is None:
+                continue
+            if mg:
+                samples.append((int(me.group(1)), int(mg.group(1))))
+            elif mf:
+                gr3d_mode = gr3d_mode or "mhz"
+                freqs = [int(x) for x in mf.group(1).split(",") if x.strip()]
+                samples.append((int(me.group(1)), sum(freqs) / len(freqs) if freqs else None))
+            else:
+                samples.append((int(me.group(1)), None))
         if not samples:
             out.append(
-                f"**{prefix}** — {len(lines)} 行采样但零条 EMC/GR3D 字段：tegrastats 在容器内读不到 "
-                "sysfs 节点时会静默省略这两个字段。`docker run` 加 `-v /sys:/sys:ro` 后重采"
-                "（handbook Step 3）。"
+                f"**{prefix}** — {len(lines)} 行采样但解析不到 EMC_FREQ："
+                "容器内 tegrastats 读不到 sysfs 节点时会静默省略字段，"
+                "`docker run` 加 `-v /sys:/sys:ro` 后重采（handbook Step 3）。"
             )
             continue
+
+        gr3d_unit = {"pct": "GR3D%", "mhz": "GR3D MHz", None: "GR3D"}[gr3d_mode]
 
         def row(name, seg):
             if not seg:
                 return [name, 0, "-", "-", "-", "-", "-"]
             se = [s[0] for s in seg]
-            sg = [s[1] for s in seg]
+            sg = [s[1] for s in seg if s[1] is not None]
             em = sum(se) / len(se)
             return [name, len(seg), f"{em:.1f}", max(se), f"{em / 100 * peak:.0f}",
-                    f"{sum(sg) / len(sg):.1f}", max(sg)]
+                    f"{sum(sg) / len(sg):.1f}" if sg else "-", f"{max(sg):.0f}" if sg else "-"]
 
         rows = []
         win_path = path + ".windows.json"
@@ -502,8 +522,10 @@ def section_emc(perf_dir, peak_gbps=None):
         out.append(
             f"**{prefix}**\n\n"
             + md_table(["阶段", "样本数", "EMC% mean", "EMC% max", "DRAM GB/s ≈",
-                        "GR3D% mean", "GR3D% max"], rows)
+                        f"{gr3d_unit} mean", f"{gr3d_unit} max"], rows)
             + f"\n\n_DRAM GB/s ≈ EMC% mean × {peak:.0f} GB/s（Thor 峰值，驱动上报值）_"
+            + ("\n\n_此 tegrastats 版本的 GR3D_FREQ 只报频率（MHz）不报利用率%，"
+               "GPU 占用请以 nsys GPU metrics 的 SMs Active 为准。_" if gr3d_mode == "mhz" else "")
         )
     if not out:
         return "_未找到 *_emc.log（采集时加 --tegrastats-log，collect_perf_data.sh 已内置）_"
