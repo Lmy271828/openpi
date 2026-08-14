@@ -368,6 +368,26 @@ sudo docker run -d --name pi05_server --runtime nvidia \
 docker logs -f pi05_server
 ```
 
+**②-bis Thor 宿主机：测 B/C 引擎的端到端延迟**（server 空闲时可共存，不用停容器；
+`--engine-path` 换成 `model_fp8_nvfp4.engine` 即测臂 C）：
+
+```bash
+sudo docker exec pi05_server bash -c '
+export PYTHONPATH=packages/openpi-client/src:src:. && \
+python deployment_scripts/pi05_inference.py \
+  --inference-mode tensorrt \
+  --config-name pi05_libero \
+  --checkpoint-dir /root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch \
+  --engine-path /root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch/engine/model_fp16.engine \
+  --num-warmup 3 --num-test-runs 20'
+
+# 看输出末尾的: Model inference time: <mean> ± <std> ms
+```
+
+参考系（Thor GB10y，pi05_libero，num_steps=10）：PyTorch BF16 ≈ 137 ms，
+TRT FP8/NVFP4 ≈ 49.9 ms；TRT fp16 预期 70-90 ms，用于把 2.75× 加速拆成
+「引擎图优化收益」和「FP8/NVFP4 量化收益」两部分。
+
 **③ x86 host：起 client**（与臂 A 命令相同，只改输出目录/日志名）：
 
 ```bash
@@ -481,6 +501,39 @@ setsid nohup bash -c '
 - 配对样本用 McNemar 检验（只看一成一败的对子）更灵敏
 - flow matching 的 noise 每次推理随机采样，单 episode 成败不可比，必须靠样本量
 - 迭代期可用 `--args.num-trials-per-task 10` 冒烟，最终结论必须 50
+
+### FlashRT 复现环境（third_party/flashrt submodule）
+
+FlashRT（自研 CUDA kernel + 静态 CUDA Graph runtime，非 TensorRT）作为推理引擎
+对照组收编为 submodule，钉在 `2035406`（2026-08-13 main）：
+
+```bash
+# 网络通时直接：
+git submodule add https://github.com/flashrt-project/FlashRT.git third_party/flashrt
+# 网络不通（加速器关闭）时，用已有的本地克隆做源，再把 URL 改回 GitHub：
+git -c protocol.file.allow=always submodule add ~/pynoob/FlashRT third_party/flashrt
+git config -f .gitmodules submodule.third_party/flashrt.url \
+  https://github.com/flashrt-project/FlashRT.git
+git -c protocol.file.allow=always submodule sync third_party/flashrt
+```
+
+组织原则（与 libero_plus 同款）：
+
+- **不改 FlashRT 源码**，适配层全部放本仓库；上游升级用 `git submodule update --remote` 可控进行
+- **运行环境独立于 openpi 容器**：Thor 宿主机建专用 venv（依赖与 l4t-jp7.2 容器可能冲突，
+  且它要编译 SM110 CUDA kernel），装完先跑最简 smoke（加载 checkpoint + 单条推理）
+- **评测拓扑：写适配 server 而不是用它自带的 eval_libero.py**。它的 eval 脚本是
+  sim+模型单进程（要在 Thor aarch64 装 robosuite，且评测实现与我们的 main.py 有
+  resize/max_steps 差异，数字无法与 A/B/C 严格配对）。计划新增
+  `deployment_scripts/flashrt_serve.py`：FlashRT 加载 checkpoint，对外讲
+  openpi-client websocket 协议——x86 侧 main.py、探针、视频归档、seed 配对零改动
+- **待验证**：它能否直接吃 `pi05_libero_pytorch` 转换后 checkpoint，还是要原始
+  JAX orbax 格式（决定适配层要不要多做权重加载转换）
+- 复现计划（对应 analysis.md 归因）：P1 = FP8 on libero_10 10×50（验证"掉点是配方
+  不是 FP8 宿命"，参照值 92.6-93.0%）；P2 = NVFP4+AWQ `use_fp4`（验证 AWQ 能否救
+  难任务，他们只在 Spatial 报过持平）；跑时停掉 pi05_server 避免 GPU 抢占污染延迟
+- 引用其文档数字前必须自己复现（README 与 examples/thor/README、USAGE 之间有
+  491/492、full-17/18 等不一致）
 
 ---
 

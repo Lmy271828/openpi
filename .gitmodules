@@ -7,3 +7,6 @@
 [submodule "third_party/libero_plus"]
 	path = third_party/libero_plus
 	url = https://github.com/sylvestf/LIBERO-plus.git
+[submodule "third_party/flashrt"]
+	path = third_party/flashrt
+	url = https://github.com/flashrt-project/FlashRT.git
