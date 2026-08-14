@@ -218,6 +218,15 @@ python deployment_scripts/analyze_perf.py --perf-dir perf_data --dram-peak-gbps 
 
 LIBERO-Long 即 `libero_10` 任务套件。三臂对照以分离"TRT 转换误差"与"量化误差"：
 
+| 臂 | 权重/计算精度 | 推理路径 | 回答的问题 |
+|---|---|---|---|
+| A | **BF16**（原始浮点权重，不量化） | PyTorch eager + torch.compile | 基准成功率 |
+| B | **FP16**（浮点权重，不量化） | ONNX → TensorRT 引擎 | 转换误差（A − B）：ONNX 导出、TRT kernel 融合、bf16→fp16 数值差异 |
+| C | **FP8 权重/激活 + NVFP4 LLM**（量化） | ONNX（QDQ）→ TensorRT 引擎 | 量化误差（B − C）：低精度带来的额外掉点 |
+
+B 与 C 的代码路径完全相同，唯一差别是引擎是否量化；A − C 的总掉点由此拆成
+"转换"和"量化"两段归因。
+
 ```bash
 export CKPT=~/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch
 ```
@@ -257,18 +266,40 @@ docker logs -f pi05_server
 - 启动日志出现 `[trt hooks] attention mask dtype fix installed` 才说明
   dtype 补丁（SDPA bias 与 query 同 dtype）已生效；缺了它第一个 client 请求必炸
   （`invalid dtype for bias`，client 侧表现为 1011 internal error）
-- 换臂：见下节「换臂操作：臂 A 跑完 → 起臂 C」
+- 换臂：见下节「换臂操作：server 换引擎 / client 换输出目录」
 - 想要崩溃自动拉起：加 `--restart unless-stopped`（与 `--rm` 冲突，二选一）
 
-### 换臂操作：臂 A 跑完 → 起臂 C（TRT FP8/NVFP4）
+### 换臂操作：server 换引擎 / client 换输出目录
 
 臂 A 全量跑完（client 日志出现 `Total success rate`）后：
 
 ```bash
-# ① Thor 宿主机：停掉臂 A server
+# ① Thor 宿主机：停掉当前 server
 sudo docker stop pi05_server && sudo docker rm pi05_server
+```
 
-# ② Thor 宿主机：臂 C server（仅比臂 A 多最后两行 TRT 参数）
+**臂 B 专属：先构建 fp16 引擎**（臂 C 跳过——fp8/nvfp4 引擎已建好）。
+在 Thor 容器内（可用 `docker run --rm -it ... bash` 或临时进 server 容器）：
+
+```bash
+# ONNX 导出（--precision fp16 是默认值，不量化、不需要校准，比 fp8 快）
+python deployment_scripts/pytorch_to_onnx.py \
+  --checkpoint_dir $CKPT --output_path $CKPT \
+  --config_name pi05_libero --precision fp16
+
+# 引擎构建（产出 $CKPT/engine/model_fp16.engine）
+ACTION_HORIZON=10 bash deployment_scripts/build_engine.sh \
+  $CKPT/onnx/model_fp16.onnx \
+  $CKPT/engine/model_fp16.engine
+
+# 可选的 5 分钟数值预检（通过再花 5 小时跑 LIBERO）：
+# pi05_inference.py --inference-mode compare 的 cosine similarity 应 ≥ 0.999
+```
+
+**② Thor 宿主机：起 B/C 的 server**（两者命令相同，只换 `--tensorrt-engine` 路径；
+注意 TRT 参数是顶层参数，必须在 `policy:checkpoint` 之前）：
+
+```bash
 sudo docker run -d --name pi05_server --runtime nvidia \
   --cap-add SYS_ADMIN \
   --network host \
@@ -284,17 +315,19 @@ sudo docker run -d --name pi05_server --runtime nvidia \
            export PYTHONPATH=packages/openpi-client/src:src:. && \
            python scripts/serve_policy.py --port 8000 \
              --use-tensorrt \
-             --tensorrt-engine /root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch/engine/model_fp8_nvfp4.engine \
+             --tensorrt-engine /root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch/engine/model_<fp16|fp8_nvfp4>.engine \
              policy:checkpoint \
              --policy.config=pi05_libero \
              --policy.dir=/root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch"
 
 # 确认就绪：看到 server listening on 0.0.0.0:8000
-# （TRT 首次加载引擎可能花几分钟；起不来先看完整日志，这条 serve 路径
-#   此前只跑过推理脚本、未在 serve 场景实测过）
+# （TRT 首次加载引擎可能花几分钟）
 docker logs -f pi05_server
+```
 
-# ③ x86 host：臂 C client（与臂 A 命令相同，只改输出目录/日志名）
+**③ x86 host：起 client**（与臂 A 命令相同，只改输出目录/日志名）：
+
+```bash
 cd ~/pynoob/openpi
 setsid nohup bash -c '
   source examples/libero/.venv/bin/activate &&
@@ -303,19 +336,19 @@ setsid nohup bash -c '
     --args.task-suite-name libero_10 \
     --args.num-trials-per-task 50 \
     --args.host <THOR_IP> --args.port 8000 \
-    --args.video-out-path eval_out/libero10_armC
-' > eval_out/armC.log 2>&1 < /dev/null &
-pgrep -f "python examples/libero/main.py" | tail -1 > eval_out/armC.pid
+    --args.video-out-path eval_out/libero10_arm<B|C>
+' > eval_out/arm<B|C>.log 2>&1 < /dev/null &
+pgrep -f "python examples/libero/main.py" | tail -1 > eval_out/arm<B|C>.pid
 ```
 
 - server 异常退出排查：`docker logs pi05_server`（容器已删则宿主机
   `dmesg | grep -i oom` 查 OOM）
 
-| 臂 | server 启动命令（Thor 容器内） | 作用 |
-|---|---|---|
-| A | `python scripts/serve_policy.py --port 8000 policy:checkpoint --policy.config=${CONFIG_NAME} --policy.dir=$CKPT` | PyTorch BF16 基准 |
-| B | `python scripts/serve_policy.py --port 8000 --use-tensorrt --tensorrt-engine $CKPT/engine/model_fp16.engine policy:checkpoint --policy.config=${CONFIG_NAME} --policy.dir=$CKPT`（需另建 fp16 引擎，可选） | 隔离转换误差 |
-| C | `python scripts/serve_policy.py --port 8000 --use-tensorrt --tensorrt-engine $CKPT/engine/model_fp8_nvfp4.engine policy:checkpoint --policy.config=${CONFIG_NAME} --policy.dir=$CKPT` | 量化总掉点 |
+| 臂 | 权重类型 | server 启动命令（Thor 容器内） | 作用 |
+|---|---|---|---|
+| A | BF16 浮点（不量化） | `python scripts/serve_policy.py --port 8000 policy:checkpoint --policy.config=${CONFIG_NAME} --policy.dir=$CKPT` | PyTorch BF16 基准 |
+| B | FP16 浮点（不量化） | `python scripts/serve_policy.py --port 8000 --use-tensorrt --tensorrt-engine $CKPT/engine/model_fp16.engine policy:checkpoint --policy.config=${CONFIG_NAME} --policy.dir=$CKPT`（需先按上节构建 fp16 引擎） | 隔离转换误差 |
+| C | FP8 + NVFP4（量化） | `python scripts/serve_policy.py --port 8000 --use-tensorrt --tensorrt-engine $CKPT/engine/model_fp8_nvfp4.engine policy:checkpoint --policy.config=${CONFIG_NAME} --policy.dir=$CKPT` | 量化总掉点 |
 
 注意 tyro 的参数归属规则：`--port`、`--use-tensorrt`、`--tensorrt-engine` 是顶层参数，
 必须放在子命令 `policy:checkpoint` **之前**；放之后会报 Unrecognized options。

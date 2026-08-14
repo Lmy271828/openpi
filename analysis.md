@@ -157,6 +157,8 @@ NVFP4 动态量化开销（`*Dyna*` 类算子）：69 个，合计 6.23 ms（10.
 
 # LIBERO-Long 成功率对照（臂 A vs 臂 C，量化掉点）
 
+臂的定义（权重/计算精度）：**A = PyTorch BF16**（原始浮点权重，不量化，eager + torch.compile）；**B = TRT FP16**（浮点权重不量化，ONNX → TensorRT 引擎，用于隔离转换误差，尚未跑）；**C = TRT FP8 权重/激活 + NVFP4 LLM**（量化，与 B 同一代码路径）。A − B 归因"转换误差"（ONNX 导出、TRT 融合、bf16→fp16），B − C 归因"量化误差"。
+
 评测设置：`libero_10`（LIBERO-Long）× 50 trials = 500 episodes/臂；固定 seed=7 + 固定初始状态，两臂逐 episode 配对；server 在 Thor（detached 容器），client 在 x86 host（nohup）。两臂全程零异常（无 `Caught exception`，无垃圾失败）。数据：`eval_out/armA.log`、`eval_out/armC.log`，视频 `eval_out/libero10_armA/`、`eval_out/libero10_armC/`。
 
 | 臂 | 成功率 | 备注 |
