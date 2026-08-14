@@ -194,16 +194,19 @@ def eval_libero(args: Args) -> None:
 
 
 def _log_episode_probe(env, done):
-    """Log pairwise XY distances between task objects of interest, plus the goal state at episode end."""
+    """Log final world-frame position (signed, cm) of each task object, joint states
+    (e.g. microwave door), and the goal state at episode end. Pairwise signed deltas
+    are computed offline from these absolute positions."""
     try:
-        names = list(env.obj_of_interest)
         inner = env.env  # OffScreenRenderEnv -> bddl domain env (owns obj_body_id)
-        pos = {name: np.asarray(env.sim.data.body_xpos[inner.obj_body_id[name]]) for name in names}
         parts = []
-        for i in range(len(names)):
-            for j in range(i + 1, len(names)):
-                d = np.linalg.norm(pos[names[i]][:2] - pos[names[j]][:2])
-                parts.append(f"{names[i]}~{names[j]}={d * 100:.1f}cm")
+        for name in env.obj_of_interest:
+            pos = env.sim.data.body_xpos[inner.obj_body_id[name]]
+            parts.append(f"{name}=({pos[0] * 100:.1f},{pos[1] * 100:.1f},{pos[2] * 100:.1f})cm")
+            joints = getattr(inner.get_object(name), "joints", [])
+            if joints:
+                qps = [env.sim.data.qpos[env.sim.model.get_joint_qpos_addr(j)] for j in joints]
+                parts.append(f"{name}_joints=[" + ",".join(f"{q:.3f}" for q in qps) + "]")
         logging.info(f"[probe] final_check_success={env.check_success()} done={done} | " + " ".join(parts))
     except Exception as e:
         logging.warning(f"[probe] failed: {e}")
