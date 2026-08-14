@@ -279,9 +279,25 @@ sudo docker stop pi05_server && sudo docker rm pi05_server
 ```
 
 **臂 B 专属：先构建 fp16 引擎**（臂 C 跳过——fp8/nvfp4 引擎已建好）。
-在 Thor 容器内（可用 `docker run --rm -it ... bash` 或临时进 server 容器）：
+在 Thor 宿主机上另起一个临时构建容器（`--rm` 退出即删，产物落在挂载卷 `$CKPT/engine/` 不丢）：
 
 ```bash
+sudo docker run --rm -it --runtime nvidia \
+  --cap-add SYS_ADMIN \
+  --network host \
+  -v "$PWD":/workspace \
+  -v "$HOME/.cache/openpi":/root/.cache/openpi \
+  -v "$HOME/.cache/huggingface":/root/.cache/huggingface \
+  -w /workspace \
+  openpi-pi0.5:l4t-jp7.2 
+  bash
+
+# ---- 以下为容器内命令 ----
+TF_DIR=/usr/local/lib/python3.12/dist-packages/transformers && \
+  cp -r src/openpi/models_pytorch/transformers_replace/* $TF_DIR/
+export PYTHONPATH=packages/openpi-client/src:src:.
+export CKPT=/root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch
+
 # ONNX 导出（--precision fp16 是默认值，不量化、不需要校准，比 fp8 快）
 python deployment_scripts/pytorch_to_onnx.py \
   --checkpoint_dir $CKPT --output_path $CKPT \
@@ -295,6 +311,7 @@ ACTION_HORIZON=10 bash deployment_scripts/build_engine.sh \
 # 可选的 5 分钟数值预检（通过再花 5 小时跑 LIBERO）：
 # pi05_inference.py --inference-mode compare 的 cosine similarity 应 ≥ 0.999
 ```
+
 
 **② Thor 宿主机：起 B/C 的 server**（两者命令相同，只换 `--tensorrt-engine` 路径；
 注意 TRT 参数是顶层参数，必须在 `policy:checkpoint` 之前）：
