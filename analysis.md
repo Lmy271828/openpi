@@ -155,8 +155,44 @@ NVFP4 动态量化开销（`*Dyna*` 类算子）：69 个，合计 6.23 ms（10.
 
 **6. 访存流量只是 warmup 假象（已由 sqlite 切窗证实）。** 全窗口 CSV 里 PyTorch 有 D2D 452.8 ms × 11270、H2D 70.4 ms，但按 test 窗口过滤后，单次稳态推理的 memcpy 合计仅 **~0.1 ms / ≤1 MB**（H2D 0.5 MB ≈ 3 路 224×224×3 输入图像，符合预期）。两个后端皆然——稳态访存不是优化对象，GPU 时间几乎全在计算上。
 
+# LIBERO-Long 成功率对照（臂 A vs 臂 C，量化掉点）
+
+评测设置：`libero_10`（LIBERO-Long）× 50 trials = 500 episodes/臂；固定 seed=7 + 固定初始状态，两臂逐 episode 配对；server 在 Thor（detached 容器），client 在 x86 host（nohup）。两臂全程零异常（无 `Caught exception`，无垃圾失败）。数据：`eval_out/armA.log`、`eval_out/armC.log`，视频 `eval_out/libero10_armA/`、`eval_out/libero10_armC/`。
+
+| 臂 | 成功率 | 备注 |
+|---|---|---|
+| A（PyTorch BF16） | **458/500 = 91.6%** | 与官方 π0.5@30k Libero-10 = 92.4% 一致，基准复现成立 |
+| C（TRT FP8/NVFP4） | **400/500 = 80.0%** | Δ = **-11.6%** |
+
+**McNemar 配对检验：p = 3.6e-08**（A成C败 85 对 vs A败C成 27 对，并集 112 对）——掉点高度显著，远超 n=500 二项噪声（95% CI ≈ ±4.4%）。结论：**FP8/NVFP4 量化在 LIBERO-Long 上造成真实成功率损失，约 -12 个百分点**。
+
+逐任务分解（每任务 50 trials，A% → C%；指令即 rollout 视频文件名主体 `rollout_<指令>_success|failure.mp4`）：
+
+| task | 指令 | A | C | Δ |
+|---|---|---|---|---|
+| 0 | put both the alphabet soup and the tomato sauce in the basket | 96% | 92% | -4% |
+| 1 | put both the cream cheese box and the butter in the basket | 98% | 92% | -6% |
+| 2 | turn on the stove and put the moka pot on it | 94% | 82% | -12% |
+| 3 | put the black bowl in the bottom drawer of the cabinet and close it | 98% | 86% | -12% |
+| **4** | **put the white mug on the left plate and put the yellow and white mug on the right plate** | **98%** | **46%** | **-52%** |
+| 5 | pick up the book and place it in the back compartment of the caddy | 100% | 92% | -8% |
+| 6 | put the white mug on the plate and put the chocolate pudding to the right of the plate | 90% | 76% | -14% |
+| 7 | put both the alphabet soup and the cream cheese box in the basket | 94% | 94% | 0% |
+| 8 | put both moka pots on the stove | 60% | 80% | **+20%** |
+| 9 | put the yellow and white mug in the microwave and close it | 88% | 60% | -28% |
+
+注：`main.py` 的视频文件名不含 episode 编号，同一任务同一结局的多段 rollout 会互相覆盖，目录里只剩最后一段；逐 episode 的成败时序以 `eval_out/armA.log` / `armC.log` 的 `Success:` 行为准。
+
+观察：
+
+- **掉点高度集中**：task4 一个任务贡献了近一半的总掉点（-52%），task9（-28%）次之；其余任务在 -4% ~ -14%。量化损伤不是均匀的精度退化，而是压垮了特定任务的决策余量。
+- task8 反向 +20%（A 臂 60% 本身明显低于官方水平，属 A 侧的弱任务），单 episode 成败受 flow matching 采样噪声影响，单任务 ±20% 不构成"C 更好"的证据。
+- 后续动作归因优先看 task4 的 failure 视频（`eval_out/libero10_armC/`），区分"同一模式反复失败"（系统性损伤）与"失败模式发散"（方差变大）。
+
 ## 后续行动
 
+- [ ] 看 task4 / task9 的 failure 视频，归类失败模式（系统性 vs 方差）
+- [ ] LIBERO-Plus 鲁棒性评测（7 扰动维度，submodule 已在 `third_party/libero_plus`）
 - [ ] TRT：评估 NVFP4 静态 scale / Dyna 算子融合（预期省 ~5-6 ms/次）
 - [ ] 评估 LLM 层与 expert denoise 的层级流水（重叠窗口 3.16 ms/step）
 - [ ] （可选）提高 tegrastats 采样率（--tegrastats-interval 20~50 ms）以加密 test 阶段 EMC 样本，当前 7/3 个样本只够看量级
