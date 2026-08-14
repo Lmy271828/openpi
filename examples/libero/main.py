@@ -3,6 +3,7 @@ import dataclasses
 import logging
 import math
 import pathlib
+import typing
 
 import imageio
 from libero.libero import benchmark
@@ -36,6 +37,8 @@ class Args:
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
+    task_ids: typing.Optional[typing.List[int]] = None  # Restrict eval to these task ids (default: all)
+    probe: bool = False  # Log pairwise XY distances of task objects + final goal state at episode end
 
     #################################################################################################################
     # Utils
@@ -74,7 +77,8 @@ def eval_libero(args: Args) -> None:
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+    task_ids = args.task_ids if args.task_ids is not None else list(range(num_tasks_in_suite))
+    for task_id in tqdm.tqdm(task_ids):
         # Get task
         task = task_suite.get_task(task_id)
 
@@ -164,6 +168,9 @@ def eval_libero(args: Args) -> None:
             task_episodes += 1
             total_episodes += 1
 
+            if args.probe:
+                _log_episode_probe(env, done)
+
             # Save a replay video of the episode
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")
@@ -184,6 +191,22 @@ def eval_libero(args: Args) -> None:
 
     logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
     logging.info(f"Total episodes: {total_episodes}")
+
+
+def _log_episode_probe(env, done):
+    """Log pairwise XY distances between task objects of interest, plus the goal state at episode end."""
+    try:
+        names = list(env.obj_of_interest)
+        inner = env.env  # OffScreenRenderEnv -> bddl domain env (owns obj_body_id)
+        pos = {name: np.asarray(env.sim.data.body_xpos[inner.obj_body_id[name]]) for name in names}
+        parts = []
+        for i in range(len(names)):
+            for j in range(i + 1, len(names)):
+                d = np.linalg.norm(pos[names[i]][:2] - pos[names[j]][:2])
+                parts.append(f"{names[i]}~{names[j]}={d * 100:.1f}cm")
+        logging.info(f"[probe] final_check_success={env.check_success()} done={done} | " + " ".join(parts))
+    except Exception as e:
+        logging.warning(f"[probe] failed: {e}")
 
 
 def _get_libero_env(task, resolution, seed):
