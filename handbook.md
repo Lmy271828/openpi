@@ -308,8 +308,12 @@ ACTION_HORIZON=10 bash deployment_scripts/build_engine.sh \
   $CKPT/onnx/model_fp16.onnx \
   $CKPT/engine/model_fp16.engine
 
-# 可选的 5 分钟数值预检（通过再花 5 小时跑 LIBERO）：
-# pi05_inference.py --inference-mode compare 的 cosine similarity 应 ≥ 0.999
+# 5 分钟数值预检（cosine ≥ 0.999 再往下走，否则回去修导出，别浪费 5 小时跑 LIBERO）
+python deployment_scripts/pi05_inference.py \
+  --inference-mode compare \
+  --config-name pi05_libero \
+  --checkpoint-dir $CKPT \
+  --engine-path $CKPT/engine/model_fp16.engine
 ```
 
 
@@ -317,6 +321,7 @@ ACTION_HORIZON=10 bash deployment_scripts/build_engine.sh \
 注意 TRT 参数是顶层参数，必须在 `policy:checkpoint` 之前）：
 
 ```bash
+# armB
 sudo docker run -d --name pi05_server --runtime nvidia \
   --cap-add SYS_ADMIN \
   --network host \
@@ -332,11 +337,32 @@ sudo docker run -d --name pi05_server --runtime nvidia \
            export PYTHONPATH=packages/openpi-client/src:src:. && \
            python scripts/serve_policy.py --port 8000 \
              --use-tensorrt \
-             --tensorrt-engine /root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch/engine/model_<fp16|fp8_nvfp4>.engine \
+             --tensorrt-engine /root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch/engine/model_fp16.engine \
              policy:checkpoint \
              --policy.config=pi05_libero \
              --policy.dir=/root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch"
 
+# armC
+sudo docker run -d --name pi05_server --runtime nvidia \
+  --cap-add SYS_ADMIN \
+  --network host \
+  -v "$PWD":/workspace \
+  -v "$HOME/.cache/openpi":/root/.cache/openpi \
+  -v "$HOME/.cache/huggingface":/root/.cache/huggingface \
+  -v /usr/bin/tegrastats:/usr/bin/tegrastats:ro \
+  -v /sys:/sys:ro \
+  -w /workspace \
+  openpi-pi0.5:l4t-jp7.2 \
+  bash -c "TF_DIR=/usr/local/lib/python3.12/dist-packages/transformers && \
+           cp -r src/openpi/models_pytorch/transformers_replace/* \$TF_DIR/ && \
+           export PYTHONPATH=packages/openpi-client/src:src:. && \
+           python scripts/serve_policy.py --port 8000 \
+             --use-tensorrt \
+             --tensorrt-engine /root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch/engine/model_fp8_nvfp4.engine \
+             policy:checkpoint \
+             --policy.config=pi05_libero \
+             --policy.dir=/root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch"
+             
 # 确认就绪：看到 server listening on 0.0.0.0:8000
 # （TRT 首次加载引擎可能花几分钟）
 docker logs -f pi05_server
@@ -409,6 +435,42 @@ pgrep -f "python examples/libero/main.py" | tail -1 > eval_out/<臂标记>.pid
   但 stdin 悬空的进程在终端关闭时仍可能收到信号）
 - 起跑 3–5 分钟没有 episode 完成是正常的：server 端首次推理触发 torch.compile；
   若日志出现批量 `Caught exception`，先查 server（`docker logs pi05_server`）
+
+### LIBERO-Plus 鲁棒性评测（7 扰动维度 × 30 任务子集）
+
+环境独立于原版 LIBERO：专用 venv `examples/libero/.venv-plus`（libero 指向
+`third_party/libero_plus`，robosuite 冲突已用放宽版 requirements 解决），
+config 切换用备份双份：
+
+```bash
+cp ~/.libero/config.yaml.libero_plus ~/.libero/config.yaml   # 切到 plus
+cp ~/.libero/config.yaml.libero ~/.libero/config.yaml        # 切回原版
+```
+
+评测子集：`eval_out/libero_plus_subset.json`（seed=42，7 维度 × 30 任务 = 210，
+按难度 1-5 分层、每层 6 个；Objects Layout 的 level5 只有 3 个，缺口补到了 level1）。
+两臂用同一子集、每任务 1 trial，逐任务配对。
+
+```bash
+# x86 host，openpi 仓库根目录（server 侧与 Step 6 完全相同，不用动）
+cd ~/pynoob/openpi
+setsid nohup bash -c '
+  source examples/libero/.venv-plus/bin/activate &&
+  export PYTHONPATH=$PYTHONPATH:$PWD/third_party/libero_plus &&
+  TASK_IDS=$(python3 -c "import json; print(\" \".join(map(str, json.load(open(\"eval_out/libero_plus_subset.json\"))[\"task_ids_0based\"])))") &&
+  python examples/libero/main.py \
+    --args.task-suite-name libero_10 \
+    --args.task-ids $TASK_IDS \
+    --args.num-trials-per-task 1 \
+    --args.host <THOR_IP> --args.port 8000 \
+    --args.video-out-path eval_out/libero_plus_<臂标记>
+' > eval_out/plus_<臂标记>.log 2>&1 < /dev/null &
+```
+
+- 先跑 2-3 个任务冒烟（`--args.task-ids` 只给前几个 id），确认新 assets 加载正常再全量
+- 判读：按维度分组比较 A vs C 成功率（每维度 n=30，CI≈±18%，看方向和大差距）；
+  量化在扰动下的掉点显著大于基准掉点的维度 = 部署风险维度
+- 子集再生成：`task_classification.json` 里 id 是 1-based，suite 索引 = id − 1（已验证）
 
 判读规则：
 
