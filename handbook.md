@@ -222,12 +222,103 @@ LIBERO-Long 即 `libero_10` 任务套件。三臂对照以分离"TRT 转换误�
 export CKPT=~/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch
 ```
 
+### server 的稳健启动方式（detached 容器 + tmux 看日志）
+
+交互式 `docker run -it` 里的 server 会随终端/SSH 断开被杀（容器还是 `--rm` 的，直接消失）；
+client 不会自动重连，之后每个 episode 都在第一次 infer 失败、被记为 False——
+实测曾因此产生 115 个垃圾失败（一帧的 failure 视频即为此类异常的特征，
+真实任务失败的视频是完整长度的）。评测务必让 server 脱离终端：
+
+```bash
+# Thor 宿主机上：server 作为容器主进程后台运行（注意是 -d，不是 -it；不要用 --rm）
+sudo docker run -d --name pi05_server --runtime nvidia \
+  --cap-add SYS_ADMIN \
+  --network host \
+  -v "$PWD":/workspace \
+  -v "$HOME/.cache/openpi":/root/.cache/openpi \
+  -v "$HOME/.cache/huggingface":/root/.cache/huggingface \
+  -v /usr/bin/tegrastats:/usr/bin/tegrastats:ro \
+  -v /sys:/sys:ro \
+  -w /workspace \
+  openpi-pi0.5:l4t-jp7.2 \
+  bash -c "TF_DIR=/usr/local/lib/python3.12/dist-packages/transformers && \
+           cp -r src/openpi/models_pytorch/transformers_replace/* \$TF_DIR/ && \
+           export PYTHONPATH=packages/openpi-client/src:src:. && \
+           python scripts/serve_policy.py --port 8000 policy:checkpoint \
+             --policy.config=pi05_libero \
+             --policy.dir=/root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch"
+
+# 观察日志（tmux 包住，SSH 断开也能回来看）
+tmux new -s serve
+docker logs -f pi05_server
+# Ctrl+b d 脱离；tmux attach -t serve 重新d进入
+```
+
+- 启动日志出现 `[trt hooks] attention mask dtype fix installed` 才说明
+  dtype 补丁（SDPA bias 与 query 同 dtype）已生效；缺了它第一个 client 请求必炸
+  （`invalid dtype for bias`，client 侧表现为 1011 internal error）
+- 换臂：见下节「换臂操作：臂 A 跑完 → 起臂 C」
+- 想要崩溃自动拉起：加 `--restart unless-stopped`（与 `--rm` 冲突，二选一）
+
+### 换臂操作：臂 A 跑完 → 起臂 C（TRT FP8/NVFP4）
+
+臂 A 全量跑完（client 日志出现 `Total success rate`）后：
+
+```bash
+# ① Thor 宿主机：停掉臂 A server
+sudo docker stop pi05_server && sudo docker rm pi05_server
+
+# ② Thor 宿主机：臂 C server（仅比臂 A 多最后两行 TRT 参数）
+sudo docker run -d --name pi05_server --runtime nvidia \
+  --cap-add SYS_ADMIN \
+  --network host \
+  -v "$PWD":/workspace \
+  -v "$HOME/.cache/openpi":/root/.cache/openpi \
+  -v "$HOME/.cache/huggingface":/root/.cache/huggingface \
+  -v /usr/bin/tegrastats:/usr/bin/tegrastats:ro \
+  -v /sys:/sys:ro \
+  -w /workspace \
+  openpi-pi0.5:l4t-jp7.2 \
+  bash -c "TF_DIR=/usr/local/lib/python3.12/dist-packages/transformers && \
+           cp -r src/openpi/models_pytorch/transformers_replace/* \$TF_DIR/ && \
+           export PYTHONPATH=packages/openpi-client/src:src:. && \
+           python scripts/serve_policy.py --port 8000 \
+             --use-tensorrt \
+             --tensorrt-engine /root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch/engine/model_fp8_nvfp4.engine \
+             policy:checkpoint \
+             --policy.config=pi05_libero \
+             --policy.dir=/root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch"
+
+# 确认就绪：看到 server listening on 0.0.0.0:8000
+# （TRT 首次加载引擎可能花几分钟；起不来先看完整日志，这条 serve 路径
+#   此前只跑过推理脚本、未在 serve 场景实测过）
+docker logs -f pi05_server
+
+# ③ x86 host：臂 C client（与臂 A 命令相同，只改输出目录/日志名）
+cd ~/pynoob/openpi
+setsid nohup bash -c '
+  source examples/libero/.venv/bin/activate &&
+  export PYTHONPATH=$PYTHONPATH:$PWD/third_party/libero &&
+  python examples/libero/main.py \
+    --args.task-suite-name libero_10 \
+    --args.num-trials-per-task 50 \
+    --args.host <THOR_IP> --args.port 8000 \
+    --args.video-out-path eval_out/libero10_armC
+' > eval_out/armC.log 2>&1 < /dev/null &
+pgrep -f "python examples/libero/main.py" | tail -1 > eval_out/armC.pid
+```
+
+- server 异常退出排查：`docker logs pi05_server`（容器已删则宿主机
+  `dmesg | grep -i oom` 查 OOM）
+
 | 臂 | server 启动命令（Thor 容器内） | 作用 |
 |---|---|---|
 | A | `python scripts/serve_policy.py --port 8000 policy:checkpoint --policy.config=${CONFIG_NAME} --policy.dir=$CKPT` | PyTorch BF16 基准 |
-| B | A + `--use-tensorrt --tensorrt-engine $CKPT/engine/model_fp16.engine`（需另建 fp16 引擎，可选） | 隔离转换误差 |
-| C | A + `--use-tensorrt --tensorrt-engine $CKPT/engine/model_fp8_nvfp4.engine` | 量化总掉点 |
+| B | `python scripts/serve_policy.py --port 8000 --use-tensorrt --tensorrt-engine $CKPT/engine/model_fp16.engine policy:checkpoint --policy.config=${CONFIG_NAME} --policy.dir=$CKPT`（需另建 fp16 引擎，可选） | 隔离转换误差 |
+| C | `python scripts/serve_policy.py --port 8000 --use-tensorrt --tensorrt-engine $CKPT/engine/model_fp8_nvfp4.engine policy:checkpoint --policy.config=${CONFIG_NAME} --policy.dir=$CKPT` | 量化总掉点 |
 
+注意 tyro 的参数归属规则：`--port`、`--use-tensorrt`、`--tensorrt-engine` 是顶层参数，
+必须放在子命令 `policy:checkpoint` **之前**；放之后会报 Unrecognized options。
 
 client（x86 仿真机，需先按 `examples/libero/README.md` 装好 LIBERO 环境）：
 
@@ -238,6 +329,36 @@ python examples/libero/main.py \
   --args.host <THOR_IP> --args.port 8000 \
   --args.video-out-path eval_out/libero10_<臂标记>
 ```
+
+### client 的稳健启动方式（x86 host，nohup 脱离会话）
+
+500 episodes 约 5 小时，client 同样不能挂在交互终端/AI 会话上。注意两侧的分工：
+**server 在 Thor**（detached 容器，见上节），**client 在 x86 host**（nohup）：
+
+```bash
+# x86 host 上，openpi 仓库根目录
+cd ~/pynoob/openpi
+setsid nohup bash -c '
+  source examples/libero/.venv/bin/activate &&
+  export PYTHONPATH=$PYTHONPATH:$PWD/third_party/libero &&
+  python examples/libero/main.py \
+    --args.task-suite-name libero_10 \
+    --args.num-trials-per-task 50 \
+    --args.host <THOR_IP> --args.port 8000 \
+    --args.video-out-path eval_out/libero10_<臂标记>
+' > eval_out/<臂标记>.log 2>&1 < /dev/null &
+
+# 记录真实 python PID（$! 是外层 bash 的，杀了不顶用）
+pgrep -f "python examples/libero/main.py" | tail -1 > eval_out/<臂标记>.pid
+```
+
+- 观察：`tail -f eval_out/<臂标记>.log`；进度 `grep -c "Success:" eval_out/<臂标记>.log`
+- 中止：`kill $(cat eval_out/<臂标记>.pid)`
+- `setsid` + `nohup` + `< /dev/null` 三者都要：脱离控制终端、免疫 SIGHUP、
+  断开 stdin（LIBERO 首次 import 有交互式 `input()` 提问，配置已生成则不会再问，
+  但 stdin 悬空的进程在终端关闭时仍可能收到信号）
+- 起跑 3–5 分钟没有 episode 完成是正常的：server 端首次推理触发 torch.compile；
+  若日志出现批量 `Caught exception`，先查 server（`docker logs pi05_server`）
 
 判读规则：
 
@@ -272,6 +393,9 @@ python examples/libero/main.py \
 | `Illegal --gpu-metrics-devices usage ... Insufficient privilege` | 容器缺权限，`docker run` 加 `--cap-add SYS_ADMIN` 重开 |
 | 没有生成 `*_emc.log` / 日志提示 `tegrastats not found` | 容器内没有 tegrastats 二进制（logger 会静默禁用）。`docker run` 加 `-v /usr/bin/tegrastats:/usr/bin/tegrastats:ro` 重开后重跑 |
 | `*_emc.log` 有采样行但无 EMC_FREQ/GR3D_FREQ 字段 | 容器只挂了 tegrastats 二进制没挂 `/sys`，tegrastats 读不到 sysfs 节点时静默省略字段。`docker run` 加 `-v /sys:/sys:ro` 重开后重跑 |
+| EMC 分阶段表 inference_test 0 样本 | GB10y tegrastats 实际采样 ~8 Hz（名义 100 ms），index×间隔对齐漂移 ~20 s/110 s。analyze_perf.py 与 logger 已改为按行时间戳对齐（相对首样本，免时区），旧日志重跑 analyze 即可 |
+| client 首请求即 1011 / `invalid dtype for bias` | PyTorch 路径的加性 attention mask 是 fp32、query 是 bf16，编译后 SDPA 要求同 dtype。`serve_policy.py` 已自动安装 `install_attention_mask_dtype_fix`（启动日志应有 `[trt hooks] attention mask dtype fix installed`）；没有这行说明脚本不是最新 |
+| 评测中途批量 `no close frame received or sent`、failure 视频只有一帧 | server 进程死了（终端断开或崩溃），client 不重连、每集首步 infer 即异常退出，垃圾失败会计入成功率——该轮数据作废。用 Step 6 的 detached 容器方式起 server；`docker logs pi05_server` 或 `dmesg \| grep -i oom` 查死因 |
 | nsys GPU metrics 里没有 DRAM 指标 | Tegra iGPU 的 DRAM 在 SoC 侧 EMC，不归 GPU metrics 采样——用 `--tegrastats-log`（本分支工具）或 NCU `dram__*` |
 | host 的 nsys 打不开 Thor 的 `.nsys-rep` | 版本前向不兼容；改读 `nsys stats` 同时导出的 `.sqlite`（标准 SQLite，跨版本可查），`analyze_perf.py` 已这么做 |
 | ptc/trt 的 `*_sum.csv` 是 0 字节 | 稳态计算在 CUDA graph replay 内，此 nsys 版本不归因 graph 内 kernel——预期行为，不是采集失败 |
