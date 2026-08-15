@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 
 import torch
 from torch import Tensor
@@ -401,6 +402,28 @@ class PI0Pytorch(nn.Module):
 
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
+
+        # Optional custom time grid via env PI05_T_GRID, e.g. "0.6:-1.0;0.1:-0.1:0.9".
+        # Each step is "t_eval:dt[:input_scale]": evaluate velocity at t_eval, advance x_t by dt*v,
+        # and optionally rescale x_t by input_scale first (re-entering the time axis, MIP-style).
+        t_grid = os.environ.get("PI05_T_GRID")
+        if t_grid:
+            x_t = noise
+            for spec in t_grid.split(";"):
+                parts = spec.split(":")
+                t_eval, step = float(parts[0]), float(parts[1])
+                if len(parts) > 2:
+                    x_t = x_t * float(parts[2])
+                time = torch.tensor(t_eval, dtype=torch.float32, device=device)
+                v_t = self.denoise_step(
+                    state,
+                    prefix_pad_masks,
+                    past_key_values,
+                    x_t,
+                    time.expand(bsize),
+                )
+                x_t = x_t + step * v_t
+            return x_t
 
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
