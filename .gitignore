@@ -176,3 +176,4 @@ cython_debug/
 # others
 perf_data/
 eval_out/
+*.pdf
