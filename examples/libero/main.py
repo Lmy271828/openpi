@@ -205,8 +205,14 @@ def _log_episode_probe(env, done):
             parts.append(f"{name}=({pos[0] * 100:.1f},{pos[1] * 100:.1f},{pos[2] * 100:.1f})cm")
             joints = getattr(inner.get_object(name), "joints", [])
             if joints:
-                qps = [env.sim.data.qpos[env.sim.model.get_joint_qpos_addr(j)] for j in joints]
-                parts.append(f"{name}_joints=[" + ",".join(f"{q:.3f}" for q in qps) + "]")
+                # robosuite get_joint_qpos_addr：1 维关节（门铰链）返回 int 地址，
+                # free/ball 关节返回 (start, end) 切片元组（binding_utils.py:504-519）
+                segs = []
+                for j in joints:
+                    addr = env.sim.model.get_joint_qpos_addr(j)
+                    q = env.sim.data.qpos[addr[0]:addr[1]] if isinstance(addr, tuple) else env.sim.data.qpos[addr:addr + 1]
+                    segs.append(f"{j}=[" + ",".join(f"{v:.3f}" for v in q) + "]")
+                parts.append(" ".join(segs))
         logging.info(f"[probe] final_check_success={env.check_success()} done={done} | " + " ".join(parts))
     except Exception as e:
         logging.warning(f"[probe] failed: {e}")
@@ -216,7 +222,9 @@ def _get_libero_env(task, resolution, seed):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
     task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
-    env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
+    # str(): libero_plus 的 env_wrapper 会对 bddl_file_name 做字符串匹配/拆分（"_view_"/"_initstate_"），
+    # 传 PosixPath 会 TypeError；原版 libero 两种类型都接受。
+    env_args = {"bddl_file_name": str(task_bddl_file), "camera_heights": resolution, "camera_widths": resolution}
     env = OffScreenRenderEnv(**env_args)
     env.seed(seed)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description

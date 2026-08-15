@@ -142,7 +142,7 @@ NVFP4 动态量化开销（`*Dyna*` 类算子）：69 个，合计 6.23 ms（10.
 
 # 结论
 
-**1. 端到端：TRT 比 PyTorch(torch.compile) 快 2.75×。** sqlite 直读的稳态 test 窗口：TRT 49.9 ms vs PyTorch 137.2 ms（sweep 干净值 T(10)=131.0 ms；窗口含 NVTX 探针与 graph replay 开销，略高 ~5% 属预期）。两后端稳态计算都完整包在 CUDA graph 内（TRT 整次推理仅 1 次 cudaGraphLaunch；PyTorch 39 次），kern_sum 的 10949 ms 几乎全是 warmup/compile 痕迹，不能用于对比。
+**1. 端到端：TRT 比 PyTorch(torch.compile) 快 2.75×，引擎与量化贡献约各占一半。** sqlite 直读的稳态 test 窗口：TRT FP8/NVFP4 49.9 ms vs PyTorch 137.2 ms（sweep 干净值 T(10)=131.0 ms；窗口含 NVTX 探针与 graph replay 开销，略高 ~5% 属预期）。补测 TRT **fp16**（同 ONNX 链路、不量化，`pi05_inference.py --inference-mode tensorrt`，w3/r20）：**85.79 ± 0.18 ms**。于是 2.75× 可干净拆分：**PyTorch BF16 →(引擎图优化 1.60×)→ TRT fp16 →(FP8/NVFP4 量化 1.72×)→ 49.9 ms**——图融合/CUDA-graph/内存规划与低精度 tensorop GEMM 的贡献大致相当，量化不是唯一来源，不量化的 TRT 部署本身已值 1.6×。两后端稳态计算都完整包在 CUDA graph 内（TRT 整次推理仅 1 次 cudaGraphLaunch；PyTorch 39 次），kern_sum 的 10949 ms 几乎全是 warmup/compile 痕迹，不能用于对比。
 测量修复记录（供追溯）：① NVTX 探针的可变全局计数器使 dynamo 每个 denoise 步重编译，默认 `recompile_limit=8` 耗尽后 idx≥8 的步回退 eager（窗口虚高 ~4%）；② 曾误用 `@torch._dynamo.disable` 修复——graph break 把 kernel 挤出 CUDA graph（graphLaunch 39→9，裸露 kernel 83→11142，窗口恶化到 274 ms），该轮作废；③ 正确修复：`torch._dynamo.config.recompile_limit=64`，10 个步数变体 warmup 全部编译完，稳态既有逐步 NVTX 标签又保住 graph（本轮已验证：39 次 graphLaunch 恢复）。
 
 **2. PyTorch 侧 kernel 总量是 warmup 假象。** 85%（9315 ms / 71912 次）是 `FillFunctor<int>`——int32 填充，来自 compile/warmup 阶段反复建 mask / position id，稳态窗口内不存在（稳态可见 kernel 仅 0.24 ms）。对比分析应完全基于 test 窗口数据。
@@ -157,7 +157,7 @@ NVFP4 动态量化开销（`*Dyna*` 类算子）：69 个，合计 6.23 ms（10.
 
 # LIBERO-Long 成功率对照（臂 A vs 臂 C，量化掉点）
 
-臂的定义（权重/计算精度）：**A = PyTorch BF16**（原始浮点权重，不量化，eager + torch.compile）；**B = TRT FP16**（浮点权重不量化，ONNX → TensorRT 引擎，用于隔离转换误差，尚未跑）；**C = TRT FP8 权重/激活 + NVFP4 LLM**（量化，与 B 同一代码路径）。A − B 归因"转换误差"（ONNX 导出、TRT 融合、bf16→fp16），B − C 归因"量化误差"。
+臂的定义（权重/计算精度）：**A = PyTorch BF16**（原始浮点权重，不量化，eager + torch.compile）；**B = TRT FP16**（浮点权重不量化，ONNX → TensorRT 引擎，用于隔离转换误差）；**C = TRT FP8 权重/激活 + NVFP4 LLM**（量化，与 B 同一代码路径）。A − B 归因"转换误差"（ONNX 导出、TRT 融合、bf16→fp16），B − C 归因"量化误差"。
 
 评测设置：`libero_10`（LIBERO-Long）× 50 trials = 500 episodes/臂；固定 seed=7 + 固定初始状态，两臂逐 episode 配对；server 在 Thor（detached 容器），client 在 x86 host（nohup）。两臂全程零异常（无 `Caught exception`，无垃圾失败）。数据：`eval_out/armA.log`、`eval_out/armC.log`，视频 `eval_out/libero10_armA/`、`eval_out/libero10_armC/`。
 
@@ -188,13 +188,124 @@ NVFP4 动态量化开销（`*Dyna*` 类算子）：69 个，合计 6.23 ms（10.
 观察：
 
 - **掉点高度集中**：task4 一个任务贡献了近一半的总掉点（-52%），task9（-28%）次之；其余任务在 -4% ~ -14%。量化损伤不是均匀的精度退化，而是压垮了特定任务的决策余量。
-- task8 反向 +20%（A 臂 60% 本身明显低于官方水平，属 A 侧的弱任务），单 episode 成败受 flow matching 采样噪声影响，单任务 ±20% 不构成"C 更好"的证据。
-- 后续动作归因优先看 task4 的 failure 视频（`eval_out/libero10_armC/`），区分"同一模式反复失败"（系统性损伤）与"失败模式发散"（方差变大）。
+- task8 反向 +20%（A 臂 60% 是 A 自身分布的离群任务——其余 9 任务均 ≥88%；官方未公布逐任务基线，无法与外部对照），单 episode 成败受 flow matching 采样噪声影响，且配对检验 p=0.021 未通过多重比较校正，按噪声处理，不构成"C 更好"的证据。
+
+## 臂 B（TRT FP16）归因：转换零掉点，-11.6% 全部来自量化
+
+臂 B 全量 500 集跑完（`eval_out/armB.log`）：**465/500 = 93.0%**。三臂对照（同一批 seed/初始状态逐集配对）：
+
+| 臂 | 成功率 | vs A |
+|---|---|---|
+| A（PyTorch BF16） | 458/500 = 91.6% | — |
+| **B（TRT FP16）** | **465/500 = 93.0%** | **+1.4%** |
+| C（TRT FP8/NVFP4） | 400/500 = 80.0% | -11.6% |
+
+McNemar 配对检验：
+
+| 对比 | 分歧对（前者成后者败 : 前者败后者成） | p |
+|---|---|---|
+| B vs A | 30 : 23 | **0.41（不显著）** |
+| B vs C | 90 : 25 | **8.4e-10** |
+| A vs C | 85 : 27 | 3.6e-08 |
+
+逐任务（每任务 50 trials）：
+
+| task | A | B | C | B−A | C−B |
+|---|---|---|---|---|---|
+| 0 | 96% | 94% | 92% | -2% | -2% |
+| 1 | 98% | 100% | 92% | +2% | -8% |
+| 2 | 94% | 96% | 82% | +2% | -14% |
+| 3 | 98% | 98% | 86% | 0% | -12% |
+| **4** | **98%** | **98%** | **46%** | **0%** | **-52%** |
+| 5 | 100% | 100% | 92% | 0% | -8% |
+| 6 | 90% | 94% | 76% | +4% | -18% |
+| 7 | 94% | 100% | 94% | +6% | -6% |
+| 8 | 60% | 58% | 80% | -2% | +22% |
+| 9 | 88% | 92% | 60% | +4% | -32% |
+
+结论：
+
+1. **A − B（转换误差）≈ 0**：bf16→fp16、ONNX 导出、TRT 图融合合计对成功率无统计影响（p=0.41，B 甚至略高 1.4%，在噪声内）。**ONNX→TensorRT 这条部署链路本身是无损的**。
+2. **B − C（量化误差）= -13.0%（93.0% → 80.0%），p=8.4e-10**：A vs C 的 -11.6% 全部来自 FP8/NVFP4 量化，一分都摊不到转换头上。
+3. **task4 悬崖是纯量化现象**：B 在 task4 上 98%，与 A 完全一致；C 掉到 46%。这排除了"ONNX/TRT 图变换破坏动作分布"的假设，坐实了探针节的机制结论——量化误差把落点分布右移 ~1cm。
+4. **task8 噪声论被交叉验证**：B=58% 与 A=60% 几乎一致（两个独立实现都复现了 A 侧的低成功率），说明 task8 ~60% 是该任务在 π₀.₅ 权重下的固有水平，C 的 80% 是采样噪声，不是量化收益。
+5. **优化方向明确**：既然转换无损、掉点全在量化，精力应全部投在量化配方上——混合精度（action expert 输出头/末层留 fp16）、更好的校准集与 scale、QDQ/Dyna 算子融合减少中间舍入。预期先把 task4/task9 这两个阈值敏感任务拉回 80-90%，总成功率即可回到 ~88-90%。
+
+## task4 探针复测：-52% 的机制是"落点偏心 1cm"，不是"任务失败"
+
+为定位 task4 的掉点机制，用 `--args.task-ids 4 --args.probe` 对臂 C 单任务复测 50 集（`eval_out/task4_probe_armC.log`，逐集视频在 `eval_out/task4_probe_armC/archived/`），探针在每集结束时记录杯-盘 XY 距离（即判定器 `check_ontop` 使用的几何量，见 `third_party/libero/libero/libero/envs/object_states/base_object_states.py:87-94`：`On(mug, plate)` = 接触 + 杯子在上方 + **杯盘中心 XY 距离 < 3cm**）。
+
+结果（复测成功率 40%，与全量的 46% 一致）：
+
+| | n | 两杯中较差者的盘心距离（中位） | 最差 |
+|---|---|---|---|
+| 成功集 | 20 | 2.7cm | 3.0cm（全部压线内） |
+| 失败集 | 30 | 3.7cm | 22.1cm |
+
+- **30 个失败中 24 个（80%）是"差 1-2cm"的擦边失败**：双杯都落在盘边 5cm 以内、视觉上已完成放置，但有一只杯子超出 3cm 阈值；典型剧集终态 3.4cm、4.0cm、4.1cm。仅 6 个是真未放置（~20cm）。
+- 成功集则全部压在 3.0cm 内（中位 2.7cm）——判定边界两侧各 1cm 内集中了大部分剧集，**成功/失败的分布正好骑在 3cm 阈值上**。
+
+结论：
+
+1. **task4 的 -52% 不是语义层面的"不会做这个任务"，而是落点精度系统性退化 ~1cm，被 3cm 二元阈值放大成成功率悬崖**。失败视频里"放好了但夹爪反复微调"正是这个机制的表现——policy 没有判定器反馈，按训练分布继续输出微调动作直到超时。
+2. **判定器与人眼语义的偏差**：`On` 是盘心 3cm 半径的几何测试，比"杯子在盘子里"严格（盘子半径约 8-10cm）。肉眼验收与判定器结论在临界样本上不一致是预期的，不是标注错误。
+3. **对优化方向的含义**：成功率对数值误差的响应是高度非线性的——既然失败分布集中在阈值外 0.5-2cm，把落点分布整体左移 ~1cm（混合精度保留 action expert 输出头、更好的校准 scale、QDQ 融合减少中间舍入），task4 有望从 40% 回到 80-90%，无需消除全部量化误差。
+4. **遗留问题**：本探针只测了臂 C 单侧分布；臂 A 的 98% 成功率已隐含其分布集中在 3cm 内，未单独复测（判定为非必要）。分布右移的定量幅度（~1cm）由 C 侧成功/失败分布反推，如需精确值可对 A 做同样探针。
+
+## LIBERO-Plus 鲁棒性评测：臂 A 基线（210 任务 × 1 trial）
+
+子集：`eval_out/libero_plus_subset.json`（7 扰动维度 × 30 任务，难度 1-5 分层，seed=42，任务为 libero_10 的扰动变体）。臂 A（PyTorch BF16）总成功率 **171/210 = 81.4%**（基准 libero_10 为 91.6%，扰动总体代价约 -10%），全程零异常，210 段视频齐（`eval_out/plus_armA.log`、`eval_out/libero_plus_armA/`）。
+
+按扰动维度（每维度 n=30，二项 95% CI ≈ ±18%，看排序不看小数点）：
+
+| 维度 | 成功率 | 解读 |
+|---|---|---|
+| Light Conditions | 30/30 = 100% | 免疫 |
+| Background Textures | 29/30 = 97% | 基本免疫 |
+| Language Instructions | 29/30 = 97% | 基本免疫（指令改写不影响） |
+| Objects Layout | 25/30 = 83% | 轻度敏感 |
+| Robot Initial States | 23/30 = 77% | 中度敏感 |
+| Sensor Noise | 20/30 = 67% | 高敏感 |
+| **Camera Viewpoints** | **15/30 = 50%** | **最脆弱维度，接近掷硬币** |
+
+按难度等级：level1 96% → level2 90% → level3 83% → level4 71% → level5 64%，单调下降，子集难度标注有效。
+
+结论：
+
+1. **π₀.₅ 的鲁棒性短板是几何扰动，不是语义/纹理扰动**：相机位姿（50%）和传感器噪声（67%）这两个改变视觉输入几何/低层统计的维度最致命；光照、背景、语言改写几乎无损。与 VLA 模型训练分布内泛化的预期一致——LIBERO 训练数据的相机是固定的。
+2. **相机位姿是部署风险的优先项**：50% 意味着实机部署时相机安装偏差必须严格控制（或训练时加位姿增强），这比任何量化问题都致命（量化全幅掉点才 -11.6%）。注意 LIBERO-Plus 的 `_view_` 扰动**只动场景相机（agentview）**；腕部相机绑在夹爪上跟随机械臂，不受其影响（策略输入始终是双路：agentview + `robot0_eye_in_hand`，见 `examples/libero/main.py:119-136`；rollout 视频只录了 agentview 一路）。也就是说臂 A 在 Camera Viewpoints 掉到 50% 是**在腕部视角完好的情况下发生的**——场景相机一路退化就足以压垮任务，π₀.₅ 对 agentview 的依赖相当重。
+3. ~~待臂 C 同子集跑完后做逐任务配对~~ → 已完成，见下节。
+
+## LIBERO-Plus 臂 C 对照：量化 × 扰动交互分析（A/C 逐任务配对）
+
+臂 C（TRT FP8/NVFP4）同子集 210 集跑完（`eval_out/plus_armC.log`）：**135/210 = 64.3%** vs 臂 A 的 81.4%，**Δ = -17.1%**（干净 libero_10 上为 -11.6%）。McNemar 配对：**A成C败 44 对 vs A败C成 8 对，p = 4.0e-07**——扰动下的量化掉点显著且方向一边倒。
+
+逐维度配对（每维度 n=30；配对比 = A成C败 : A败C成）：
+
+| 维度 | A | C | Δ | 配对比 | 交互判定 |
+|---|---|---|---|---|---|
+| **Background Textures** | 97% | **50%** | **-47%** | **14:0** | **强交互（最大）** |
+| **Robot Initial States** | 77% | 50% | **-27%** | **8:0** | **强交互** |
+| Objects Layout | 83% | 70% | -13% | 6:2 | 与干净环境相当 |
+| Light Conditions | 100% | 87% | -13% | 4:0 | 中等交互 |
+| Language Instructions | 97% | 87% | -10% | 4:1 | 与干净环境相当 |
+| Sensor Noise | 67% | 60% | -7% | 5:3 | 弱（部分地板效应） |
+| Camera Viewpoints | 50% | 47% | -3% | 3:2 | 无（地板效应：A 已 50%，无下降空间） |
+
+结论：
+
+1. **量化 × 扰动的交互是真实存在且维度特异的**：A 几乎免疫的 Background Textures（97%）在 C 上崩到 50%，配对比 14:0——**量化把"纹理鲁棒"的模型变成了"纹理敏感"的模型**。Robot Initial States 同型（77→50，8:0）。
+2. **机制与 off-manifold 框架自洽**（见 Much Ado About Noising 调研）：新纹理/新初始位姿把视觉输入轻推离训练流形，浮点模型的纠错余量（迭代计算的流形投影效应）能吸收；量化吃掉的正是这部分余量。Camera/Sensor Noise 维度看不到交互不是"量化无害"，而是 A 已被扰动本身压到地板（50%/67%），没有可下降的余量。
+3. **A成C败的 44 个任务高度集中于"阈值敏感三兄弟"的纹理变体**：LIVING_ROOM_SCENE5（task4 双杯放盘，5 个）、SCENE6（task6 杯+布丁，3 个）、KITCHEN_SCENE6（task9 微波炉，2 个）——与干净环境下 task4/9/6 主导掉点的格局一致，量化损伤的任务谱在扰动下没有漂移，只是被放大。
+4. **部署含义**：TRT FP8/NVFP4 的量化配方不仅掉基准成功率，还**显著削弱分布外鲁棒性**——实机环境必然偏离训练纹理/光照分布，-17.1%（而非 -11.6%）才是真实部署预期的掉点量级。量化配方优化（混合精度、AWQ、静态 scale）的验收标准应包含 Plus 子集，而不只是干净 libero_10。
 
 ## 后续行动
 
-- [ ] 看 task4 / task9 的 failure 视频，归类失败模式（系统性 vs 方差）
-- [ ] LIBERO-Plus 鲁棒性评测（7 扰动维度，submodule 已在 `third_party/libero_plus`）
+- [x] 看 task4 的 failure 模式（探针复测：80% 失败为 3-5cm 擦边偏心，见上节）
+- [x] LIBERO-Plus 臂 A（81.4%，维度排序：相机位姿 50% 最脆弱，光照/背景/语言免疫，见上节）
+- [x] LIBERO-Plus 臂 C 同子集 + 逐任务配对（64.3%，p=4.0e-07；Background Textures 97→50% 是最大交互维度，见上节）
+- [ ] [切 C server] task4 带符号探针 + task9 探针（各 50 集）
+- [ ] FlashRT 复现（P1: FP8 on libero_10；P2: NVFP4+AWQ），环境方案见 handbook「FlashRT 复现环境」
 - [ ] TRT：评估 NVFP4 静态 scale / Dyna 算子融合（预期省 ~5-6 ms/次）
 - [ ] 评估 LLM 层与 expert denoise 的层级流水（重叠窗口 3.16 ms/step）
 - [ ] （可选）提高 tegrastats 采样率（--tegrastats-interval 20~50 ms）以加密 test 阶段 EMC 样本，当前 7/3 个样本只够看量级
