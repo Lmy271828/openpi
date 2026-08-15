@@ -1,13 +1,12 @@
 # π₀.5 on Jetson AGX Thor 部署与性能复现手册
 
-> 目标：任何人按本手册操作，可以在 AGX Thor 上复现 π₀.₅（`pi05_libero`）的
-> TensorRT FP8/NVFP4 部署、推理性能数据（含 DRAM 带宽观测）和 LIBERO-Long 成功率。
+> 目标：复现 π₀.₅（`pi05_libero`）在 Thor 上的 TensorRT FP8/NVFP4 部署、推理性能数据、
+> LIBERO-Long 三臂成功率对照、task4/9 探针分析与 LIBERO-Plus 鲁棒性评测。
 >
-> 本手册与 [OpenPi π₀.₅ on Jetson Thor | Jetson AI Lab](https://www.jetson-ai-lab.com/tutorials/openpi_on_thor/)
-> 的关系：本分支（`nvidia-trt`）**已内置**该教程的全部部署脚本与源码补丁，
-> 因此教程的 Step 2（打补丁/下载脚本）**不需要执行**；环境准备见本手册 Step 1–3，
-> **从容器内环境配置（教程 Step 5）到 TensorRT 推理（教程 Step 12）按官方教程执行**，
-> 之后的性能采集与成功率评测用本手册 Step 4–6（本分支新增工具）。
+> 与 [官方教程](https://www.jetson-ai-lab.com/tutorials/openpi_on_thor/) 的关系：
+> 本分支（`nvidia-trt`）已内置教程的全部脚本与补丁，教程 Step 2 跳过；
+> 环境准备见本手册 Step 1–3；容器内配置到 TRT 推理按官方教程 Step 5–12；
+> 之后的性能采集与成功率评测用本手册 Step 4–6。
 
 ---
 
@@ -16,74 +15,47 @@
 | 角色 | 配置 | 用途 |
 |---|---|---|
 | **Thor** | Jetson AGX Thor DevKit，JetPack 7.2（L4T R39.x），MAXN 功耗模式 | 部署、推理、性能采集、policy server |
-| **host** | x86_64 Linux（分析机） | 解析 profiling 数据、跑 LIBERO 仿真 client |
+| **host** | x86_64 Linux | 解析 profiling 数据、跑 LIBERO 仿真 client |
 
-软件基线：Docker 28+、nvidia-container-toolkit 1.18+、容器镜像 `openpi-pi0.5:l4t-jp7.2`
+软件基线：Docker 28+、nvidia-container-toolkit 1.18+、镜像 `openpi-pi0.5:l4t-jp7.2`
 （base `nvcr.io/nvidia/pytorch:26.05-py3`，内置 nsys 2026.2.1 / TensorRT 10.16 / ModelOpt 0.43）。
 
-验证环境：
-
 ```bash
-cat /etc/nv_tegra_release     # 应显示 R39
-nvidia-smi                    # Thor GPU，CUDA 13.x
+cat /etc/nv_tegra_release
+nvidia-smi
 docker --version
 ```
 
 ---
 
-## Step 0：Fork 并克隆本分支
-
-在 GitHub 上 Fork `https://github.com/Lmy271828/openpi`（或直接克隆），然后：
+## Step 0：克隆本分支
 
 ```bash
 git clone -b nvidia-trt --recurse-submodules \
   https://github.com/<你的用户名>/openpi.git
 cd openpi
-git log --oneline -5
 ```
 
-应看到（自上而下）：
+分支内容 = 上游 `15a9616`（教程验证基线）+ 部署脚本、TRT serve 支持、性能采集工具、
+LIBERO 评测工具（`--task-ids`、探针、视频归档器）与 LIBERO-Plus/FlashRT submodule。
 
-```
-<latest>  Remove round-1 perf report and data; re-measure on libero_10
-34c6d0f   Add DRAM bandwidth observability to perf tooling
-d484582   Add Thor deployment scripts and TensorRT FP8/NVFP4 perf analysis
-8f1d732   Add TensorRT engine backend to serve_policy and relax checkpoint loading
-15a9616   update output objects to support batching (#975)   ← 上游分叉点（教程验证的 commit）
-```
-
-分支内容 = 上游 `15a9616`（教程验证基线）+ 四层增量：
-
-- `8f1d732`：`serve_policy.py` 支持 `--use-tensorrt` / `--tensorrt-engine`；checkpoint 加载 `strict=False`
-- `d484582`：`deployment_scripts/` 全套（ONNX 导出、引擎构建、nsys 采集、num_steps 扫描）
-- `34c6d0f`：tegrastats 阶段对齐（`--tegrastats-log`）+ GPU metrics 按 S2/S3 NVTX 探针精确切窗
-- 最新：产物命名规范化（`pi05_<backend>[_<engine>]_<config>_w<W>_r<R>`）与大文件 gitignore
-
-> **与官方教程的差异**：教程 Step 2.2 的 `download.sh`（下载 deployment_scripts + 打 4 个补丁）
-> 在本分支上**全部跳过**——脚本和补丁（含 `transformers_replace`、`serve_policy` TRT 支持）
-> 已在仓库内。
-
----
-
-## Step 1：Thor 设为最高性能（对应教程 Step 1）
+## Step 1：Thor 设为最高性能（教程 Step 1）
 
 ```bash
-sudo nvpmodel -m 0        # MAXN
-sudo jetson_clocks        # 锁定最高频率
-sudo jetson_clocks --show # 验证
+sudo nvpmodel -m 0
+sudo jetson_clocks
+sudo jetson_clocks --show
 ```
 
-> 性能数据对功耗模式敏感：非 MAXN 下数字不可比。
+性能数据对功耗模式敏感：非 MAXN 下数字不可比。
 
-## Step 2：构建 Docker 镜像（对应教程 Step 3）
+## Step 2：构建 Docker 镜像（教程 Step 3）
 
 ```bash
 sudo docker build -t openpi-pi0.5:l4t-jp7.2 -f deployment_scripts/thor.Dockerfile .
 ```
 
-首次构建 15–20 分钟。base 镜像在 `nvcr.io`，拉取失败先 `docker login nvcr.io`。
-
-## Step 3：启动容器（对应教程 Step 4，**多两个参数**）
+## Step 3：启动容器（教程 Step 4，多两个参数）
 
 ```bash
 sudo docker run --rm -it --runtime nvidia \
@@ -100,94 +72,63 @@ sudo docker run --rm -it --runtime nvidia \
 
 与教程的差异及原因：
 
-- `--cap-add SYS_ADMIN`：GPU metrics 采样（Step 4 的 DRAM/SM 饱和度观测）需要，不加会被
-  nsys 拒绝（`Illegal --gpu-metrics-devices usage ... Insufficient privilege`）
-- `--network host`：替代 `-p 8000:8000`，同时方便 policy server 与 tegrastats 时间对齐
-- `-v /sys:/sys:ro`：tegrastats 的 EMC_FREQ/GR3D_FREQ 读自 sysfs 节点，只挂二进制不够——
-  读不到时 tegrastats 会静默省略这两个字段（`*_emc.log` 有采样行但没有 EMC/GR3D 数据）。
-  必须把整个 `/sys` 挂进容器（NVIDIA 官方确认，forums.developer.nvidia.com/t/311539）
-- `.cache` 两个挂载务必保留：checkpoint（~6 GB）、HF 数据集、ONNX/引擎全部落在里面，
-  容器是 `--rm` 的，不挂载则每次重来
+- `--cap-add SYS_ADMIN`：GPU metrics 采样需要，否则 nsys 拒绝（Insufficient privilege）
+- `--network host`：替代 `-p 8000:8000`，方便 server 与 tegrastats 时间对齐
+- `-v /sys:/sys:ro`：tegrastats 的 EMC/GR3D 读自 sysfs；只挂二进制会静默省略这两个字段
+- `.cache` 挂载保留 checkpoint（~6 GB）、HF 数据集、ONNX/引擎产物
 
-> **注意**：容器内写出的文件属 root，宿主机上清理/传输前先收权：
-> `sudo chown -R hcclab:hcclab perf_data`
+容器内写出的文件属 root，宿主机清理前先 `sudo chown -R $USER perf_data`。
 
----
-
-## Step 3.5 → 官方教程 Step 5–12（容器内，按教程执行）
-
-从这里开始**完全按官方教程**操作，逐步对应关系与验收值：
+## Step 3.5：官方教程 Step 5–12（容器内，按教程执行）
 
 | 教程步骤 | 内容 | 验收标志 |
 |---|---|---|
-| Step 5 | `export PYTHONPATH` + 选 `CONFIG_NAME=pi05_libero` + 打 transformers 补丁 | 补丁 cp 无报错 |
-| Step 6 | 下载 JAX checkpoint（GCS 自动下载） | `~/.cache/openpi/openpi-assets/checkpoints/pi05_libero/` |
+| Step 5 | `export PYTHONPATH` + `CONFIG_NAME=pi05_libero` + transformers 补丁 | 补丁 cp 无报错 |
+| Step 6 | 下载 JAX checkpoint | `~/.cache/openpi/openpi-assets/checkpoints/pi05_libero/` |
 | Step 7 | JAX → PyTorch 转换（5–10 min） | `pi05_libero_pytorch/` 含 `model.safetensors` + `assets/` |
-| Step 8 | PyTorch 推理自检 | **~130 ms**（torch.compile BF16） |
+| Step 8 | PyTorch 推理自检 | ~137 ms（torch.compile BF16） |
 | Step 9 | ONNX 导出（FP8 + NVFP4，ModelOpt 校准） | `onnx/model_fp8_nvfp4.onnx` + `.data` |
 | Step 10 | trtexec 构建引擎（10–30 min） | `engine/model_fp8_nvfp4.engine` |
-| Step 11 | TRT 推理 | **~49 ms**，约 2.7× 加速 |
-| Step 12 | compare 模式数值对照 | cosine similarity ≈ 0.99 |
+| Step 11 | TRT 推理 | ~49.9 ms |
+| Step 12 | compare 模式数值对照 | cosine ≥ 0.99 |
 
-教程链接：[OpenPi π₀.₅ on Jetson Thor](https://www.jetson-ai-lab.com/tutorials/openpi_on_thor/)
+补充：
 
-三个补充说明：
-
-1. **Step 9 的校准数据**会自动从 HuggingFace 下载 `physical-intelligence/libero`
-   （LeRobot 格式，缓存于 `~/.cache/huggingface`）。网络受限时：
-   `export HF_ENDPOINT=https://hf-mirror.com`；需要 token 时 `export HF_TOKEN=<token>`。
-2. **不要用 `--precision fp16`**：π₀.₅ 原生 BF16，FP16 动态范围不足会在 Gemma
-   attention 层溢出（教程 Step 9 明确说明）。
+1. Step 9 的校准数据自动从 HuggingFace 下载 `physical-intelligence/libero`。
+   网络受限时 `export HF_ENDPOINT=https://hf-mirror.com`。
+2. 教程警告 FP16 会在 Gemma attention 溢出；本分支实测 fp16 引擎（臂 B）
+   cosine = 0.99999823、成功率 93.0% 无掉点——该警告不适用于当前导出脚本，
+   fp16 导出流程见 Step 6「臂 B 引擎」。
 3. 引擎构建产物（`*_profile.json` / `*_layers.json` / `.log`）在引擎同目录，
    Step 4 的采集脚本会自动拷贝。
 
 ---
 
-## Step4：性能数据采集（Thor 容器内，本分支工具）
-
-一键采集（sweep + PyTorch/TRT 两路 nsys + GPU metrics + 内嵌 tegrastats EMC + trtexec 产物）：
+## Step 4：性能数据采集（Thor 容器内）
 
 ```bash
-# 可选环境变量：CONFIG_NAME(=pi05_libero) NUM_WARMUP(=3) NUM_TEST_RUNS(=10)
-#               CKPT_DIR / ENGINE_PATH
 bash deployment_scripts/collect_perf_data.sh
 ```
 
-产物命名**编码了采集超参**，不同配置的采集互不覆盖：
+可选环境变量：`CONFIG_NAME`(=pi05_libero) `NUM_WARMUP`(=3) `NUM_TEST_RUNS`(=10)
+`CKPT_DIR` / `ENGINE_PATH`。产物命名编码采集超参，多轮互不覆盖：
 
 ```
-numsteps_sweep_<config>_w<W>_r<R>.csv                      # num_steps 扫描
-pi05_ptcompile_<config>_w<W>_r<R>{.nsys-rep,.sqlite,_*.csv}  # PyTorch torch.compile
-pi05_trt_<engine-tag>_<config>_w<W>_r<R>{.nsys-rep,...}      # TensorRT，engine-tag 取自
-                                                             # 引擎文件名（如 fp8_nvfp4）
-<prefix>_emc.log                                           # tegrastats 原始采样（EMC%/GR3D%）
-<prefix>_console.log                                       # 控制台全量输出（含分阶段 EMC 表）
+numsteps_sweep_<config>_w<W>_r<R>.csv
+pi05_ptcompile_<config>_w<W>_r<R>{.nsys-rep,.sqlite,_*.csv}
+pi05_trt_<engine-tag>_<config>_w<W>_r<R>{.nsys-rep,...}
+<prefix>_emc.log          # tegrastats（EMC%/GR3D），已内嵌推理脚本，时间轴与 nsys 对齐
+<prefix>_console.log
 ```
 
-**DRAM 带宽（EMC）采集**：Thor 是 Tegra 统一内存架构，nsys GPU metrics **不含 DRAM 计数器**
-（DRAM 挂在 SoC 侧 EMC），用 tegrastats 补齐——已嵌入推理脚本并经 `--tegrastats-log`
-并入上面的一键采集（与 nsys 同一进程、时间轴天然对齐），无需单独跑。手工单独采集时：
-
-```bash
-python deployment_scripts/pi05_inference_nvtx.py \
-  --config-name ${CONFIG_NAME} \
-  --checkpoint-dir ~/.cache/openpi/openpi-assets/checkpoints/${CONFIG_NAME}_pytorch \
-  --inference-mode tensorrt \
-  --engine-path ~/.cache/openpi/openpi-assets/checkpoints/${CONFIG_NAME}_pytorch/engine/model_fp8_nvfp4.engine \
-  --tegrastats-log perf_data/pi05_trt_fp8_nvfp4_${CONFIG_NAME}_w3_r10_emc.log
-# 输出 warmup / inference_test 两阶段的 EMC% 均值/峰值与换算 GB/s（峰值 273 GB/s），
-# 并写 <同前缀>.windows.json 供离线重新对齐；
-# 文件名遵循一键脚本规范 <prefix>_emc.log（w/r 与实际 --num-warmup/--num-test-runs 一致）
-```
-
-> 判读参考：EMC% 稳态 >80% 才是带宽瓶颈；本模型两阶段 SM Issue 仅 ~9–20%，
-> 属内存**延迟**受限而非带宽饱和（优化方向是 graph/融合/流水，不是继续压精度）。
+DRAM 带宽说明：Thor 是 Tegra 统一内存，nsys GPU metrics 不含 DRAM 计数器
+（DRAM 在 SoC 侧 EMC），由 tegrastats 补齐，无需单独采集。判读参考：EMC% 稳态
+>80% 才是带宽瓶颈；本模型 SM Issue 仅 ~9–20%，属内存延迟受限。
 
 拷回 host：
 
 ```bash
-# host 上执行
-scp hcclab@<THOR_IP>:~/lmy/openpi/perf_data/* perf_data/
+scp hcclab@10.191.163.226:~/lmy/openpi/perf_data/* perf_data/
 ```
 
 ---
@@ -198,48 +139,45 @@ scp hcclab@<THOR_IP>:~/lmy/openpi/perf_data/* perf_data/
 python deployment_scripts/analyze_perf.py --perf-dir perf_data --dram-peak-gbps 273
 ```
 
-输出各段（运行前缀自动发现，多轮采集可同目录对比）：
-
 | 段 | 数据源 | 内容 |
 |---|---|---|
-| num_steps 扫描 | `numsteps_sweep_*.csv` | 线性分解 `T(N) ≈ T_fixed + N·T_step`（ViT+LLM prefill vs expert 去噪） |
-| DRAM / 显存带宽 | `*_gpumetrics.csv` 或含 GPU_METRICS 的 `.sqlite` | DRAM 计数器（dGPU）或 Copy Engine 代理（Tegra）；含 S2/S3 NVTX 探针的采集会额外输出 prefill/expert 分阶段饱和度表 |
+| num_steps 扫描 | `numsteps_sweep_*.csv` | `T(N) ≈ T_fixed + N·T_step` 线性分解 |
+| DRAM / 显存带宽 | `*_gpumetrics.csv` / `.sqlite` | Copy Engine 代理 + S2/S3 分阶段饱和度 |
 | CUDA graph 使用 | `<prefix>.sqlite` 直读 | 稳态 graph replay 统计 |
-| nsys kernel 分析 | `<prefix>_cuda_gpu_kern_sum.csv` | kernel 分类汇总（GEMM/attention/quant/elementwise…） |
-| trtexec 逐层 profile | `*_profile.json` | ViT / LLM(NVFP4) / expert(FP8) 阶段耗时归因 |
+| nsys kernel 分析 | `*_cuda_gpu_kern_sum.csv` | kernel 分类汇总 |
+| trtexec 逐层 profile | `*_profile.json` | ViT / LLM(NVFP4) / expert(FP8) 阶段归因 |
 
-> 注意：torch.compile 与 TRT 路径稳态计算在 CUDA graph 内，kernel 级 CSV 为空属
-> **预期**（此 nsys 版本不归因 graph 内 kernel）；逐 kernel 分析用 Eager 对照组
-> （`pi05_inference_nvtx.py --profile-eager` 采集）或 trtexec 逐层 profile。
+注意：torch.compile 与 TRT 稳态计算在 CUDA graph 内，kernel 级 CSV 为空属预期
+（此 nsys 版本不归因 graph 内 kernel）；逐 kernel 分析用 Eager 对照组或 trtexec profile。
 
 ---
 
-## Step 6：LIBERO-Long 成功率评测（量化掉点对照）
+## Step 6：LIBERO-Long 成功率评测
 
-LIBERO-Long 即 `libero_10` 任务套件。三臂对照以分离"TRT 转换误差"与"量化误差"：
+LIBERO-Long 即 `libero_10` 任务套件。三臂对照分离"转换误差"与"量化误差"：
 
-| 臂 | 权重/计算精度 | 推理路径 | 回答的问题 |
+| 臂 | 精度 | 推理路径 | 作用 |
 |---|---|---|---|
-| A | **BF16**（原始浮点权重，不量化） | PyTorch eager + torch.compile | 基准成功率 |
-| B | **FP16**（浮点权重，不量化） | ONNX → TensorRT 引擎 | 转换误差（A − B）：ONNX 导出、TRT kernel 融合、bf16→fp16 数值差异 |
-| C | **FP8 权重/激活 + NVFP4 LLM**（量化） | ONNX（QDQ）→ TensorRT 引擎 | 量化误差（B − C）：低精度带来的额外掉点 |
+| A | BF16（不量化） | PyTorch eager + torch.compile | 基准 |
+| B | FP16（不量化） | ONNX → TRT 引擎 | A − B = 转换误差 |
+| C | FP8 + NVFP4（量化） | ONNX（QDQ）→ TRT 引擎 | B − C = 量化误差 |
 
-B 与 C 的代码路径完全相同，唯一差别是引擎是否量化；A − C 的总掉点由此拆成
-"转换"和"量化"两段归因。
+实测结果见 `analysis.md`（A 91.6% / B 93.0% / C 80.0%，延迟 137 / 85.8 / 49.9 ms）。
 
-```bash
-export CKPT=~/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch
-```
+### server（Thor 宿主机，detached 容器）
 
-### server 的稳健启动方式（detached 容器 + tmux 看日志）
-
-交互式 `docker run -it` 里的 server 会随终端/SSH 断开被杀（容器还是 `--rm` 的，直接消失）；
-client 不会自动重连，之后每个 episode 都在第一次 infer 失败、被记为 False——
-实测曾因此产生 115 个垃圾失败（一帧的 failure 视频即为此类异常的特征，
-真实任务失败的视频是完整长度的）。评测务必让 server 脱离终端：
+server 必须脱离终端运行：交互式容器里的 server 会随 SSH 断开被杀，client 不重连，
+之后每个 episode 首步 infer 即失败、记为垃圾失败（一帧的 failure 视频是特征）。
 
 ```bash
-# Thor 宿主机上：server 作为容器主进程后台运行（注意是 -d，不是 -it；不要用 --rm）
+sudo docker stop pi05_server 2>/dev/null; sudo docker rm pi05_server 2>/dev/null
+
+# TRT_FLAGS 按臂选择（注意：TRT 参数是顶层参数，必须在 policy:checkpoint 之前）：
+#   armA: TRT_FLAGS=""
+#   armB: TRT_FLAGS="--use-tensorrt --tensorrt-engine /root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch/engine/model_fp16.engine"
+#   armC: TRT_FLAGS="--use-tensorrt --tensorrt-engine /root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch/engine/model_fp8_nvfp4.engine"
+TRT_FLAGS=""
+
 sudo docker run -d --name pi05_server --runtime nvidia \
   --cap-add SYS_ADMIN \
   --network host \
@@ -253,62 +191,41 @@ sudo docker run -d --name pi05_server --runtime nvidia \
   bash -c "TF_DIR=/usr/local/lib/python3.12/dist-packages/transformers && \
            cp -r src/openpi/models_pytorch/transformers_replace/* \$TF_DIR/ && \
            export PYTHONPATH=packages/openpi-client/src:src:. && \
-           python scripts/serve_policy.py --port 8000 policy:checkpoint \
+           python scripts/serve_policy.py --port 8000 $TRT_FLAGS \
+             policy:checkpoint \
              --policy.config=pi05_libero \
              --policy.dir=/root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch"
 
-# 观察日志（tmux 包住，SSH 断开也能回来看）
-tmux new -s serve
-docker logs -f pi05_server
-# Ctrl+b d 脱离；tmux attach -t serve 重新d进入
+sudo docker logs -f pi05_server
 ```
 
-- 启动日志出现 `[trt hooks] attention mask dtype fix installed` 才说明
-  dtype 补丁（SDPA bias 与 query 同 dtype）已生效；缺了它第一个 client 请求必炸
-  （`invalid dtype for bias`，client 侧表现为 1011 internal error）
-- 换臂：见下节「换臂操作：server 换引擎 / client 换输出目录」
-- 想要崩溃自动拉起：加 `--restart unless-stopped`（与 `--rm` 冲突，二选一）
+就绪标志：`server listening on 0.0.0.0:8000`（TRT 首次加载引擎可能要几分钟）。
+启动日志应含 `[trt hooks] attention mask dtype fix installed`，缺了它 client 首请求必炸。
 
-### 换臂操作：server 换引擎 / client 换输出目录
-
-臂 A 全量跑完（client 日志出现 `Total success rate`）后：
+换臂 = 换 `TRT_FLAGS` 重跑上面这段；确认当前臂：
 
 ```bash
-# ① Thor 宿主机：停掉当前 server
-sudo docker stop pi05_server && sudo docker rm pi05_server
+sudo docker logs pi05_server 2>&1 | grep -iE "tensorrt|engine" | head -5
 ```
 
-**臂 B 专属：先构建 fp16 引擎**（臂 C 跳过——fp8/nvfp4 引擎已建好）。
-在 Thor 宿主机上另起一个临时构建容器（`--rm` 退出即删，产物落在挂载卷 `$CKPT/engine/` 不丢）：
+### 臂 B 引擎：构建 + 数值预检 + 延迟测试
+
+臂 C 引擎已在教程 Step 9–10 建好；臂 B 需单独构建（Thor 容器内）：
 
 ```bash
-sudo docker run --rm -it --runtime nvidia \
-  --cap-add SYS_ADMIN \
-  --network host \
-  -v "$PWD":/workspace \
-  -v "$HOME/.cache/openpi":/root/.cache/openpi \
-  -v "$HOME/.cache/huggingface":/root/.cache/huggingface \
-  -w /workspace \
-  openpi-pi0.5:l4t-jp7.2 
-  bash
-
-# ---- 以下为容器内命令 ----
 TF_DIR=/usr/local/lib/python3.12/dist-packages/transformers && \
   cp -r src/openpi/models_pytorch/transformers_replace/* $TF_DIR/
 export PYTHONPATH=packages/openpi-client/src:src:.
 export CKPT=/root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch
 
-# ONNX 导出（--precision fp16 是默认值，不量化、不需要校准，比 fp8 快）
 python deployment_scripts/pytorch_to_onnx.py \
   --checkpoint_dir $CKPT --output_path $CKPT \
   --config_name pi05_libero --precision fp16
 
-# 引擎构建（产出 $CKPT/engine/model_fp16.engine）
 ACTION_HORIZON=10 bash deployment_scripts/build_engine.sh \
   $CKPT/onnx/model_fp16.onnx \
   $CKPT/engine/model_fp16.engine
 
-# 5 分钟数值预检（cosine ≥ 0.999 再往下走，否则回去修导出，别浪费 5 小时跑 LIBERO）
 python deployment_scripts/pi05_inference.py \
   --inference-mode compare \
   --config-name pi05_libero \
@@ -316,60 +233,10 @@ python deployment_scripts/pi05_inference.py \
   --engine-path $CKPT/engine/model_fp16.engine
 ```
 
+预检通过标准：cosine ≥ 0.999（实测 0.99999823）。不达标就回去修导出，
+不要带着坏引擎跑 5 小时 LIBERO。
 
-**② Thor 宿主机：起 B/C 的 server**（两者命令相同，只换 `--tensorrt-engine` 路径；
-注意 TRT 参数是顶层参数，必须在 `policy:checkpoint` 之前）：
-
-```bash
-# armB
-sudo docker run -d --name pi05_server --runtime nvidia \
-  --cap-add SYS_ADMIN \
-  --network host \
-  -v "$PWD":/workspace \
-  -v "$HOME/.cache/openpi":/root/.cache/openpi \
-  -v "$HOME/.cache/huggingface":/root/.cache/huggingface \
-  -v /usr/bin/tegrastats:/usr/bin/tegrastats:ro \
-  -v /sys:/sys:ro \
-  -w /workspace \
-  openpi-pi0.5:l4t-jp7.2 \
-  bash -c "TF_DIR=/usr/local/lib/python3.12/dist-packages/transformers && \
-           cp -r src/openpi/models_pytorch/transformers_replace/* \$TF_DIR/ && \
-           export PYTHONPATH=packages/openpi-client/src:src:. && \
-           python scripts/serve_policy.py --port 8000 \
-             --use-tensorrt \
-             --tensorrt-engine /root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch/engine/model_fp16.engine \
-             policy:checkpoint \
-             --policy.config=pi05_libero \
-             --policy.dir=/root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch"
-
-# armC
-sudo docker run -d --name pi05_server --runtime nvidia \
-  --cap-add SYS_ADMIN \
-  --network host \
-  -v "$PWD":/workspace \
-  -v "$HOME/.cache/openpi":/root/.cache/openpi \
-  -v "$HOME/.cache/huggingface":/root/.cache/huggingface \
-  -v /usr/bin/tegrastats:/usr/bin/tegrastats:ro \
-  -v /sys:/sys:ro \
-  -w /workspace \
-  openpi-pi0.5:l4t-jp7.2 \
-  bash -c "TF_DIR=/usr/local/lib/python3.12/dist-packages/transformers && \
-           cp -r src/openpi/models_pytorch/transformers_replace/* \$TF_DIR/ && \
-           export PYTHONPATH=packages/openpi-client/src:src:. && \
-           python scripts/serve_policy.py --port 8000 \
-             --use-tensorrt \
-             --tensorrt-engine /root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch/engine/model_fp8_nvfp4.engine \
-             policy:checkpoint \
-             --policy.config=pi05_libero \
-             --policy.dir=/root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch"
-             
-# 确认就绪：看到 server listening on 0.0.0.0:8000
-# （TRT 首次加载引擎可能花几分钟）
-docker logs -f pi05_server
-```
-
-**②-bis Thor 宿主机：测 B/C 引擎的端到端延迟**（server 空闲时可共存，不用停容器；
-`--engine-path` 换成 `model_fp8_nvfp4.engine` 即测臂 C）：
+B/C 引擎端到端延迟（server 空闲时可与 pi05_server 共存，`--engine-path` 换引擎即换臂）：
 
 ```bash
 sudo docker exec pi05_server bash -c '
@@ -380,100 +247,106 @@ python deployment_scripts/pi05_inference.py \
   --checkpoint-dir /root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch \
   --engine-path /root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch/engine/model_fp16.engine \
   --num-warmup 3 --num-test-runs 20'
-
-# 看输出末尾的: Model inference time: <mean> ± <std> ms
 ```
 
-参考系（Thor GB10y，pi05_libero，num_steps=10）：PyTorch BF16 ≈ 137 ms，
-TRT FP8/NVFP4 ≈ 49.9 ms；TRT fp16 预期 70-90 ms，用于把 2.75× 加速拆成
-「引擎图优化收益」和「FP8/NVFP4 量化收益」两部分。
+看输出末尾 `Model inference time: <mean> ± <std> ms`。
+参考系（MAXN，num_steps=10）：PyTorch BF16 = 137 ms，TRT fp16 = 85.8 ms，
+TRT FP8/NVFP4 = 49.9 ms（引擎图优化 1.60× × 量化 1.72× = 2.75×）。
 
-**③ x86 host：起 client**（与臂 A 命令相同，只改输出目录/日志名）：
+### client（x86 host，nohup 脱离会话）
+
+500 episodes 约 5 小时，client 同样不能挂在交互终端上：
 
 ```bash
 cd ~/pynoob/openpi
+
 setsid nohup bash -c '
   source examples/libero/.venv/bin/activate &&
   export PYTHONPATH=$PYTHONPATH:$PWD/third_party/libero &&
   python examples/libero/main.py \
     --args.task-suite-name libero_10 \
     --args.num-trials-per-task 50 \
-    --args.host <THOR_IP> --args.port 8000 \
-    --args.video-out-path eval_out/libero10_arm<B|C>
-' > eval_out/arm<B|C>.log 2>&1 < /dev/null &
-pgrep -f "python examples/libero/main.py" | tail -1 > eval_out/arm<B|C>.pid
+    --args.host 10.191.163.226 --args.port 8000 \
+    --args.video-out-path eval_out/libero10_armA
+' > eval_out/armA.log 2>&1 < /dev/null &
 ```
 
-- server 异常退出排查：`docker logs pi05_server`（容器已删则宿主机
-  `dmesg | grep -i oom` 查 OOM）
-
-| 臂 | 权重类型 | server 启动命令（Thor 容器内） | 作用 |
-|---|---|---|---|
-| A | BF16 浮点（不量化） | `python scripts/serve_policy.py --port 8000 policy:checkpoint --policy.config=${CONFIG_NAME} --policy.dir=$CKPT` | PyTorch BF16 基准 |
-| B | FP16 浮点（不量化） | `python scripts/serve_policy.py --port 8000 --use-tensorrt --tensorrt-engine $CKPT/engine/model_fp16.engine policy:checkpoint --policy.config=${CONFIG_NAME} --policy.dir=$CKPT`（需先按上节构建 fp16 引擎） | 隔离转换误差 |
-| C | FP8 + NVFP4（量化） | `python scripts/serve_policy.py --port 8000 --use-tensorrt --tensorrt-engine $CKPT/engine/model_fp8_nvfp4.engine policy:checkpoint --policy.config=${CONFIG_NAME} --policy.dir=$CKPT` | 量化总掉点 |
-
-注意 tyro 的参数归属规则：`--port`、`--use-tensorrt`、`--tensorrt-engine` 是顶层参数，
-必须放在子命令 `policy:checkpoint` **之前**；放之后会报 Unrecognized options。
-
-client（x86 仿真机，需先按 `examples/libero/README.md` 装好 LIBERO 环境）：
+换臂只改 `video-out-path` 与日志名。监控与中止：
 
 ```bash
-python examples/libero/main.py \
-  --args.task-suite-name libero_10 \
-  --args.num-trials-per-task 50 \
-  --args.host <THOR_IP> --args.port 8000 \
-  --args.video-out-path eval_out/libero10_<臂标记>
+tail -f eval_out/armA.log
+grep -c "Success:" eval_out/armA.log
+ps -eo pid,args | grep "[m]ain.py"
+kill <PID>
 ```
 
-### client 的稳健启动方式（x86 host，nohup 脱离会话）
+- `setsid` + `nohup` + `< /dev/null` 三者都要（脱离终端、免疫 SIGHUP、断开 stdin）
+- 起跑 3–5 分钟没有 episode 完成是正常的（server 端首次推理触发 torch.compile / 引擎加载）
+- 日志出现批量 `Caught exception` 先查 server：`sudo docker logs pi05_server`
 
-500 episodes 约 5 小时，client 同样不能挂在交互终端/AI 会话上。注意两侧的分工：
-**server 在 Thor**（detached 容器，见上节），**client 在 x86 host**（nohup）：
+### task4 / task9 探针分析
+
+探针（`--args.probe`）在每集结束时记录任务物体的世界系坐标（cm，带符号）与关节
+qpos，用于把"成功率掉点"拆解为几何量偏移。前置：server 为目标臂；config 必须是
+**原版 libero**（`get_libero_path` 每个任务重读 `~/.libero/config.yaml`，
+Plus 评测运行中切 config 会把正在跑的 client 搞崩）：
 
 ```bash
-# x86 host 上，openpi 仓库根目录
+cp ~/.libero/config.yaml.libero ~/.libero/config.yaml
+
 cd ~/pynoob/openpi
 setsid nohup bash -c '
   source examples/libero/.venv/bin/activate &&
   export PYTHONPATH=$PYTHONPATH:$PWD/third_party/libero &&
-  python examples/libero/main.py \
-    --args.task-suite-name libero_10 \
-    --args.num-trials-per-task 50 \
-    --args.host <THOR_IP> --args.port 8000 \
-    --args.video-out-path eval_out/libero10_<臂标记>
-' > eval_out/<臂标记>.log 2>&1 < /dev/null &
+  python examples/libero/main.py --args.task-suite-name libero_10 --args.task-ids 4 \
+    --args.num-trials-per-task 50 --args.probe \
+    --args.host 10.191.163.226 --args.port 8000 \
+    --args.video-out-path eval_out/task4s_probe_armC &&
+  python examples/libero/main.py --args.task-suite-name libero_10 --args.task-ids 9 \
+    --args.num-trials-per-task 50 --args.probe \
+    --args.host 10.191.163.226 --args.port 8000 \
+    --args.video-out-path eval_out/task9_probe_armC
+' > eval_out/probes_armC.log 2>&1 < /dev/null &
 
-# 记录真实 python PID（$! 是外层 bash 的，杀了不顶用）
-pgrep -f "python examples/libero/main.py" | tail -1 > eval_out/<臂标记>.pid
+setsid nohup bash examples/libero/video_archiver.sh eval_out/task4s_probe_armC \
+  > eval_out/archiver_task4s.log 2>&1 < /dev/null &
+setsid nohup bash examples/libero/video_archiver.sh eval_out/task9_probe_armC \
+  > eval_out/archiver_task9.log 2>&1 < /dev/null &
 ```
 
-- 观察：`tail -f eval_out/<臂标记>.log`；进度 `grep -c "Success:" eval_out/<臂标记>.log`
-- 中止：`kill $(cat eval_out/<臂标记>.pid)`
-- `setsid` + `nohup` + `< /dev/null` 三者都要：脱离控制终端、免疫 SIGHUP、
-  断开 stdin（LIBERO 首次 import 有交互式 `input()` 提问，配置已生成则不会再问，
-  但 stdin 悬空的进程在终端关闭时仍可能收到信号）
-- 起跑 3–5 分钟没有 episode 完成是正常的：server 端首次推理触发 torch.compile；
-  若日志出现批量 `Caught exception`，先查 server（`docker logs pi05_server`）
+探针输出（每集一行，在 client 日志里）：
+
+```
+[probe] final_check_success=True done=True | plate_1=(x,y,z)cm ... white_yellow_mug_1_joint0=[7 维] ...
+```
+
+判读：
+
+- task4（双杯放盘）：判定器 `On(mug, plate)` = 接触 + 杯盘中心 XY 距离 < 3cm。
+  从探针坐标离线算杯-盘 XY 偏移，成功/失败两组的分布若骑在 3cm 上，
+  即"落点偏心被阈值放大"（实测：成功中位 2.7cm，失败中位 3.7cm，80% 失败为 3-5cm 擦边）
+- task9（杯子进微波炉并关门）：判定器 `And(In(mug, heating_region), Close(microwave))`。
+  杯坐标验证 `In`，`microwave_1_microjoint`（门铰链角度，开门 ≈ -1.55 rad）验证 `Close`，
+  失败可拆为"没放入" / "没关门" / "两者都没"
+- 逐集视频在 `archived/` 子目录（归档器按完成时间戳改名，避免同结局互相覆盖）
 
 ### LIBERO-Plus 鲁棒性评测（7 扰动维度 × 30 任务子集）
 
-环境独立于原版 LIBERO：专用 venv `examples/libero/.venv-plus`（libero 指向
-`third_party/libero_plus`，robosuite 冲突已用放宽版 requirements 解决），
-config 切换用备份双份：
+环境独立于原版：专用 venv `examples/libero/.venv-plus`（libero 指向
+`third_party/libero_plus`）。`~/.libero/config.yaml` 的双份备份首次使用前创建：
 
 ```bash
-cp ~/.libero/config.yaml.libero_plus ~/.libero/config.yaml   # 切到 plus
-cp ~/.libero/config.yaml.libero ~/.libero/config.yaml        # 切回原版
+cp ~/.libero/config.yaml ~/.libero/config.yaml.libero            # 原版备份（只需一次）
+cp ~/.libero/config.yaml.libero_plus ~/.libero/config.yaml       # 切到 plus
+cp ~/.libero/config.yaml.libero ~/.libero/config.yaml            # 切回原版
 ```
 
-评测子集：`eval_out/libero_plus_subset.json`（seed=42，7 维度 × 30 任务 = 210，
-按难度 1-5 分层、每层 6 个；Objects Layout 的 level5 只有 3 个，缺口补到了 level1）。
-两臂用同一子集、每任务 1 trial，逐任务配对。
+评测子集 `eval_out/libero_plus_subset.json`：seed=42，7 维度 × 30 任务 = 210，
+按难度 1-5 分层。两臂用同一子集、每任务 1 trial，逐任务配对。
 
 ```bash
-# x86 host，openpi 仓库根目录（server 侧与 Step 6 完全相同，不用动）
 cd ~/pynoob/openpi
+
 setsid nohup bash -c '
   source examples/libero/.venv-plus/bin/activate &&
   export PYTHONPATH=$PYTHONPATH:$PWD/third_party/libero_plus &&
@@ -482,97 +355,70 @@ setsid nohup bash -c '
     --args.task-suite-name libero_10 \
     --args.task-ids $TASK_IDS \
     --args.num-trials-per-task 1 \
-    --args.host <THOR_IP> --args.port 8000 \
-    --args.video-out-path eval_out/libero_plus_<臂标记>
-' > eval_out/plus_<臂标记>.log 2>&1 < /dev/null &
+    --args.host 10.191.163.226 --args.port 8000 \
+    --args.video-out-path eval_out/libero_plus_armA
+' > eval_out/plus_armA.log 2>&1 < /dev/null &
 ```
 
-- 先跑 2-3 个任务冒烟（`--args.task-ids` 只给前几个 id），确认新 assets 加载正常再全量
-- 判读：按维度分组比较 A vs C 成功率（每维度 n=30，CI≈±18%，看方向和大差距）；
-  量化在扰动下的掉点显著大于基准掉点的维度 = 部署风险维度
-- 子集再生成：`task_classification.json` 里 id 是 1-based，suite 索引 = id − 1（已验证）
+- 先冒烟（`--args.task-ids` 只给前 3 个 id），确认 assets 加载正常再全量
+- 判读：按维度分组比较 A vs C（每维度 n=30，CI≈±18%，看方向和配对比）
+- 扰动编码在任务名里：`view_水平_俯仰_缩放x100_旋转_俯仰_initstate_<id>_noise_<seed>`；
+  view 段非 `0_0_100_0_0` 才是相机位姿扰动（该编码被 Camera/Noise/InitState 三维共用）
 
-判读规则：
+### 判读规则
 
-- 公平性由 `main.py` 内置机制保证：固定 seed（默认 7）+ 固定初始状态，两臂 episode
-  逐对配对；`replan_steps=5`、`resize_size=224` 保持一致
-- 每套件 n = 10 任务 × 50 trials = 500 episodes，二项 95% CI ≈ ±4.4%；
-  **ΔSR < ±5% 只能下"无显著差异"结论**
-- 配对样本用 McNemar 检验（只看一成一败的对子）更灵敏
+- 固定 seed（默认 7）+ 固定初始状态，两臂 episode 逐对配对
+- 每套件 n = 500 episodes，二项 95% CI ≈ ±4.4%；ΔSR < ±5% 只能下"无显著差异"结论
+- 配对用 McNemar 检验（只看一成一败的对子）
 - flow matching 的 noise 每次推理随机采样，单 episode 成败不可比，必须靠样本量
 - 迭代期可用 `--args.num-trials-per-task 10` 冒烟，最终结论必须 50
 
-### FlashRT 复现环境（third_party/flashrt submodule）
+---
+
+## FlashRT 复现环境（third_party/flashrt submodule）
 
 FlashRT（自研 CUDA kernel + 静态 CUDA Graph runtime，非 TensorRT）作为推理引擎
-对照组收编为 submodule，钉在 `2035406`（2026-08-13 main）：
+对照组，钉在 `2035406`（2026-08-13 main）：
 
 ```bash
-# 网络通时直接：
 git submodule add https://github.com/flashrt-project/FlashRT.git third_party/flashrt
-# 网络不通（加速器关闭）时，用已有的本地克隆做源，再把 URL 改回 GitHub：
+
 git -c protocol.file.allow=always submodule add ~/pynoob/FlashRT third_party/flashrt
 git config -f .gitmodules submodule.third_party/flashrt.url \
   https://github.com/flashrt-project/FlashRT.git
 git -c protocol.file.allow=always submodule sync third_party/flashrt
 ```
 
-组织原则（与 libero_plus 同款）：
+（第一条是网络正常时；后三条是离线时用本地克隆做源再改回规范 URL。）
 
-- **不改 FlashRT 源码**，适配层全部放本仓库；上游升级用 `git submodule update --remote` 可控进行
-- **运行环境独立于 openpi 容器**：Thor 宿主机建专用 venv（依赖与 l4t-jp7.2 容器可能冲突，
-  且它要编译 SM110 CUDA kernel），装完先跑最简 smoke（加载 checkpoint + 单条推理）
-- **评测拓扑：写适配 server 而不是用它自带的 eval_libero.py**。它的 eval 脚本是
-  sim+模型单进程（要在 Thor aarch64 装 robosuite，且评测实现与我们的 main.py 有
-  resize/max_steps 差异，数字无法与 A/B/C 严格配对）。计划新增
-  `deployment_scripts/flashrt_serve.py`：FlashRT 加载 checkpoint，对外讲
-  openpi-client websocket 协议——x86 侧 main.py、探针、视频归档、seed 配对零改动
-- **待验证**：它能否直接吃 `pi05_libero_pytorch` 转换后 checkpoint，还是要原始
-  JAX orbax 格式（决定适配层要不要多做权重加载转换）
-- 复现计划（对应 analysis.md 归因）：P1 = FP8 on libero_10 10×50（验证"掉点是配方
-  不是 FP8 宿命"，参照值 92.6-93.0%）；P2 = NVFP4+AWQ `use_fp4`（验证 AWQ 能否救
-  难任务，他们只在 Spatial 报过持平）；跑时停掉 pi05_server 避免 GPU 抢占污染延迟
-- 引用其文档数字前必须自己复现（README 与 examples/thor/README、USAGE 之间有
-  491/492、full-17/18 等不一致）
+组织原则：
+
+- 不改 FlashRT 源码，适配层全部放本仓库；升级用 `git submodule update --remote`
+- 运行环境独立于 openpi 容器（Thor 宿主机专用 venv；它要编译 SM110 kernel），
+  装完先跑最简 smoke（加载 checkpoint + 单条推理）
+- 评测拓扑：写适配 server（`deployment_scripts/flashrt_serve.py`，FlashRT 对内、
+  openpi-client websocket 协议对外），不用它自带的单进程 eval_libero.py——
+  保证与 A/B/C 同 seed 逐集配对，唯一变量是推理引擎
+- 待验证：能否直接吃 `pi05_libero_pytorch` 转换后 checkpoint
+- 复现计划：P1 = FP8 on libero_10 10×50（参照值 92.6-93.0%）；
+  P2 = NVFP4+AWQ `use_fp4`；跑时停掉 pi05_server 避免 GPU 抢占
+- 引用其文档数字前必须自己复现（README 与 examples/thor/README 有不一致）
 
 ---
 
 ## 复现检查清单
 
-按本手册操作后应得到：
-
-- [ ] PyTorch BF16 ~130 ms / TRT FP8+NVFP4 ~49 ms（MAXN，action horizon 10）
-- [ ] compare 模式 cosine similarity ≈ 0.99
-- [ ] `numsteps_sweep_*.csv` 线性拟合：`T_fixed`（ViT+LLM prefill）与 `T_step`（单步 expert）分解
+- [ ] 延迟：PyTorch BF16 ~137 ms / TRT fp16 ~85.8 ms / TRT FP8+NVFP4 ~49.9 ms
+- [ ] compare 模式 cosine ≥ 0.99
+- [ ] `numsteps_sweep_*.csv` 线性拟合 T_fixed / T_step 分解
 - [ ] tegrastats EMC% 分阶段表（warmup / inference_test）
 - [ ] nsys GPU metrics 分阶段饱和度（SMs Active / SM Issue / Tensor Active × prefill / expert）
-- [ ] libero_10 三臂成功率表（每臂 500 episodes）
-
----
-
-## 排查表
-
-| 症状 | 原因与修复 |
-|---|---|
-| `ModuleNotFoundError: No module named 'openpi'` | 容器内未 `export PYTHONPATH=packages/openpi-client/src:src:.:$PYTHONPATH`（`collect_perf_data.sh` 已内置自愈，手工跑脚本时需自己 export） |
-| `Illegal --gpu-metrics-devices usage ... Insufficient privilege` | 容器缺权限，`docker run` 加 `--cap-add SYS_ADMIN` 重开 |
-| 没有生成 `*_emc.log` / 日志提示 `tegrastats not found` | 容器内没有 tegrastats 二进制（logger 会静默禁用）。`docker run` 加 `-v /usr/bin/tegrastats:/usr/bin/tegrastats:ro` 重开后重跑 |
-| `*_emc.log` 有采样行但无 EMC_FREQ/GR3D_FREQ 字段 | 容器只挂了 tegrastats 二进制没挂 `/sys`，tegrastats 读不到 sysfs 节点时静默省略字段。`docker run` 加 `-v /sys:/sys:ro` 重开后重跑 |
-| EMC 分阶段表 inference_test 0 样本 | GB10y tegrastats 实际采样 ~8 Hz（名义 100 ms），index×间隔对齐漂移 ~20 s/110 s。analyze_perf.py 与 logger 已改为按行时间戳对齐（相对首样本，免时区），旧日志重跑 analyze 即可 |
-| client 首请求即 1011 / `invalid dtype for bias` | PyTorch 路径的加性 attention mask 是 fp32、query 是 bf16，编译后 SDPA 要求同 dtype。`serve_policy.py` 已自动安装 `install_attention_mask_dtype_fix`（启动日志应有 `[trt hooks] attention mask dtype fix installed`）；没有这行说明脚本不是最新 |
-| 评测中途批量 `no close frame received or sent`、failure 视频只有一帧 | server 进程死了（终端断开或崩溃），client 不重连、每集首步 infer 即异常退出，垃圾失败会计入成功率——该轮数据作废。用 Step 6 的 detached 容器方式起 server；`docker logs pi05_server` 或 `dmesg \| grep -i oom` 查死因 |
-| nsys GPU metrics 里没有 DRAM 指标 | Tegra iGPU 的 DRAM 在 SoC 侧 EMC，不归 GPU metrics 采样——用 `--tegrastats-log`（本分支工具）或 NCU `dram__*` |
-| host 的 nsys 打不开 Thor 的 `.nsys-rep` | 版本前向不兼容；改读 `nsys stats` 同时导出的 `.sqlite`（标准 SQLite，跨版本可查），`analyze_perf.py` 已这么做 |
-| ptc/trt 的 `*_sum.csv` 是 0 字节 | 稳态计算在 CUDA graph replay 内，此 nsys 版本不归因 graph 内 kernel——预期行为，不是采集失败 |
-| 宿主机删不动 `perf_data/` 文件 | 容器内 root 写出，`sudo chown -R hcclab:hcclab perf_data` |
-| 校准/数据集下载失败 | `export HF_ENDPOINT=https://hf-mirror.com` 或配置 `HF_TOKEN` |
-| compare 模式 cosine 偶发偏低 | 每次随机 noise 所致，多跑几次或用 `--golden-noise-path` 固定 |
-| ONNX 导出报 FP4 reshape 错 | transformers 补丁没打（教程 Step 5.3 / collect 脚本自愈段） |
+- [ ] libero_10 三臂成功率：A ~91.6% / B ~93.0% / C ~80.0%（各 500 episodes）
+- [ ] LIBERO-Plus 子集：A ~81.4% / C ~64.3%（各 210 episodes）
 
 ---
 
 ## 参考
 
-- [OpenPi π₀.₅ on Jetson Thor | Jetson AI Lab](https://www.jetson-ai-lab.com/tutorials/openpi_on_thor/)（部署主流程，本手册 Step 3.5 起沿用）
-- [Physical-Intelligence/openpi](https://github.com/Physical-Intelligence/openpi)（上游仓库，分叉点 `15a9616`）
-- `docs/pi05_inference_reading_guide.md`（推理链路代码导读）
+- [OpenPi π₀.₅ on Jetson Thor | Jetson AI Lab](https://www.jetson-ai-lab.com/tutorials/openpi_on_thor/)
+- [Physical-Intelligence/openpi](https://github.com/Physical-Intelligence/openpi)（上游，分叉点 `15a9616`）
