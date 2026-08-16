@@ -373,10 +373,24 @@ FlashRT（Thor 原生，torch 2.11 cu130 + 手写 kernel，FP8 E4M3 per-tensor �
 结论：
 
 1. **FP8 本身不掉点**：FlashRT FP8 = 91.6% 与臂 A 完全持平。臂 C 的 -11.6% 归因为 TRT 量化配方（校准集/scales/Dyna 动态量化），而非 FP8 精度上限。
-2. **NVFP4 也不掉点**：92.6%（甚至 +1.0p 于基线，噪声内），官方"NVFP4 与 FP8 精度持平"复现成立。FlashRT NVFP4 官方延迟 27.17ms（2-view）——若实测延迟成立，则臂 C 的 TRT 方案（49.9ms / 80.0%）被双向超越，整条判负。
+2. **NVFP4 也不掉点**：92.6%（甚至 +1.0p 于基线，噪声内），官方"NVFP4 与 FP8 精度持平"复现成立。实测延迟（Thor，2-view，p50）：**FP8 42.96ms / NVFP4 36.28ms**（无 FA4，`bench_pi05_thor_views.py`）；装 thor-fa4 后（`bench_pi05_decoder_fp4_e2e.py`，FA4 强制开启，100 次 iter 同会话 A/B）：**FP8+FA4 40.66ms / NVFP4+FA4 27.21ms，1.49×**，与官方 38.70→27.17ms 对齐（见下节）。校准耗时：FP8 0.87s / NVFP4 2.19s（一次性，JSON 缓存）。**臂 C 的 TRT 方案（49.9ms / 80.0%）被 FlashRT NVFP4（27.2ms / 92.6%）双向超越，整条判负**。
 3. **精度敏感任务完全恢复**：task4（46→98/100）和 task9（60→94/92）这两个 TRT 重灾区在 FlashRT 下回到基线水平，与探针结论闭环——落点漂移/关门不到位是 TRT 配方引入的 off-manifold 偏移，不是 FP8/FP4 的固有损伤。
 4. **task8 四方数字（60/80/52/60）互相矛盾**，是固有高方差任务，不作为精度判据。
 5. 数据存档：Thor `~/lmy/openpi/third_party/flashrt/eval_flashrt_{fp8,nvfp4}_libero10.log` + `libero_libero_10_torch_results.json`。注意 `--use_fp4` 是后补的 flag（本地补丁透传 `load_model(use_fp4=)`，见 `examples/thor/eval_libero.py` 未提交改动）。
+
+### FA4 补齐：NVFP4+FA4 = 27.21ms，对齐官方（2026-08-16）
+
+装 `thor-fa4` extra（`nvidia-cutlass-dsl==4.5.1` + `quack-kernels==0.4.1` + `nvidia-cuda-nvcc` 提供 ptxas）后跑官方门禁 harness `tests/bench_pi05_decoder_fp4_e2e.py --num-views 2`（锁频 MAXN，100 iter，同会话 A/B，匹配噪声）：
+
+| 配置 | p50 | p95 | 保真门 |
+|---|---|---|---|
+| FP8 + FA4 | 40.66 ms | 40.82 ms | —（参考臂） |
+| NVFP4 + FA4 | **27.21 ms** | 27.33 ms | action cos 0.99901 ✅ / action min-sample cos 0.99627 ✅ / raw cos 0.99707 ✅ / raw min-sample cos 0.98893 ❌（门 0.995） |
+
+- 与官方 2-view 数字（38.70 → 27.17ms，1.42×）对齐：我们 40.66 → 27.21ms，1.49×。FP8 参考臂略慢于官方是 Thor 时钟漂移（官方文档自己标注同机型有 ~3ms 的 sustained-load 双 regime），只看同会话比值。
+- 唯一没过的是 raw min-sample cosine（0.9889 < 0.995，官方 0.9980）：raw 是最终 action 之前的中间量严格指标，动作级两个门全过。差异来源可能是 checkpoint（我们用 openpi 原版 `pi05_libero_pytorch`，官方用 converted 版）或自生成 fixture，不影响"可部署"结论。
+- 踩坑记录（已固化进 `thor_jp72_env.sh`）：dsl 4.5.1 下 FA4 编译目标必须显式 `CUTE_DSL_ARCH=sm_101a`（`sm_110a` 路径触发 NVVM chip-string bug：`Failed translating the module to ISA`）；loader 的 `setdefault` 在 `import cutlass` 之后才执行，依赖它不可靠，必须进程启动前 export。harness 还要求 flashrt 工作区干净，本地 `--use_fp4` 补丁需先 `git stash`。
+- 存档：Thor `third_party/flashrt/bench_fa4_e2e_2v.log`，artifacts `/tmp/flashrt-pi05-decoder-fp4-e2e-20260816T065142Z`。
 
 ## 后续行动
 

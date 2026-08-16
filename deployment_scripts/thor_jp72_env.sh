@@ -29,6 +29,19 @@ SP=$(python -c "import site; print(site.getsitepackages()[0])")
 # 缺失库搜索路径（见上方注释）
 export LD_LIBRARY_PATH="$SP/nvidia/cu13/lib:$SP/nvpl/lib:$LD_LIBRARY_PATH"
 
+# FA4（thor-fa4 可选加速）：arch 别名必须在 import cutlass 之前 export，
+# loader 的 setdefault 在 import 之后才执行，靠不住。
+# dsl 4.5+ 的 sm_110a 路径有 NVVM chip-string bug（Failed translating the module to ISA），
+# 必须用 sm_101a 别名；FLASH_ATTENTION_ARCH=sm_100a 选 SM100 兼容前向 kernel。
+export CUTE_DSL_ARCH=sm_101a
+export FLASH_ATTENTION_ARCH=sm_100a
+# FA4 依赖安装（一次）：
+#   pip install "nvidia-cutlass-dsl==4.5.1" "quack-kernels==0.4.1" nvidia-cuda-nvcc
+#   （nvidia-cuda-nvcc 提供 ptxas；nvidia-cuda-nvcc-cu13 已 deprecated 勿装）
+# 验证：python -c "from flash_rt.hardware.thor import fa4_backend as f; print(f.status())"  # 期望 active
+# 注意：bench_pi05_thor_views.py 直构 frontend 不带 use_fa4；官方口径数字用
+#   tests/bench_pi05_decoder_fp4_e2e.py（强制 FA4 + 要求 flashrt 工作区干净，本地补丁先 git stash）
+
 # LIBERO 评测（eval_libero.py 同进程起仿真，子进程继承环境变量）
 export PYTHONPATH="$FLASHRT_DIR/../libero:$PYTHONPATH"
 export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1   # LIBERO init_states 为老版 torch.load 写法
