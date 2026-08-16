@@ -406,6 +406,79 @@ git -c protocol.file.allow=always submodule sync third_party/flashrt
 
 ---
 
+## Omega-QVLA 复现（臂 D：W4A4 GPTQ + DuQuant）
+
+Omega-QVLA 是 openpi 的**兄弟目录独立克隆，不进 submodule**：
+
+- 本地 `~/pynoob/Omega-QVLA`，Thor `~/lmy/Omega-QVLA`，用 rsync 同步：
+  `rsync -avz --exclude=.git ~/pynoob/Omega-QVLA hcclab@10.191.163.226:~/lmy/`
+- 不进 submodule 的原因：不改它的源码（只调用），且 `packs_hf/` 里的 GPTQ pack
+  （`pi05_long/quantized.pt`，数百 MB）来自 HF 下载，不入 git
+- 集成方式：整个目录挂进 openpi 容器 `/opt/omega`，靠 `PYTHONPATH` + `GR00T_*`
+  环境变量生效，**openpi 代码零改动**。`scripts/openpi_inference_service.py`
+  是标准 openpi websocket server，启动时给 `policy._model` 套量化 Linear：
+  action expert 用预构建 GPTQ pack（W4A4 + svd_hadamard + per-step scale 表，
+  按 10 步 denoise 构建），PaliGemma 主干用 DuQuant 运行时校准（前 ~32 batch 收 scale）
+
+server（Thor 宿主机，先停掉占 GPU 的容器/进程）：
+
+```bash
+sudo docker stop pi05_server 2>/dev/null; sudo docker rm pi05_server 2>/dev/null
+
+sudo docker run -d --name pi05_server --runtime nvidia \
+  --cap-add SYS_ADMIN \
+  --network host \
+  --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v "$HOME/lmy/openpi":/workspace \
+  -v "$HOME/lmy/Omega-QVLA":/opt/omega \
+  -v "$HOME/.cache/openpi":/root/.cache/openpi \
+  -w /workspace \
+  openpi-pi0.5:l4t-jp7.2 \
+  bash -c "TF_DIR=/usr/local/lib/python3.12/dist-packages/transformers && \
+           cp -r src/openpi/models_pytorch/transformers_replace/* \$TF_DIR/ && \
+           export PYTHONPATH=packages/openpi-client/src:src:.:/opt/omega && \
+           export GR00T_GPTQ=1 \
+                  GR00T_GPTQ_PATH=/opt/omega/packs_hf/pi05_long/quantized.pt \
+                  GR00T_DUQUANT_ROT_MODE=svd_hadamard \
+                  GR00T_DUQUANT_PERM_SCORE=weight \
+                  GR00T_GPTQ_MISSING=fallback && \
+           python /opt/omega/scripts/openpi_inference_service.py \
+             --model_path /root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch \
+             --data_config pi05_libero \
+             --port 8000"
+
+sudo docker logs -f pi05_server
+```
+
+启动后必查三项：
+
+1. include 名单：日志会列出被套 GptqLinear / DuQuantLinear 的模块。
+   `state_proj`、`action_in_proj`、`action_out_proj`、`time_mlp_*` 小投影层
+   不能在内，否则显式传 `GR00T_GPTQ_INCLUDE` / `GR00T_DUQUANT_INCLUDE` 正则排除
+2. denoise 步数必须 10（pack 的 per-step scale 表按 10 步建）
+3. 前 ~32 次推理在收 DuQuant 校准 scale，确认校准完成再发评测流量
+
+client（x86 host，与臂 A 同一入口，只改输出目录）：
+
+```bash
+cd ~/pynoob/openpi
+setsid nohup bash -c '
+  source examples/libero/.venv/bin/activate &&
+  export PYTHONPATH=$PYTHONPATH:$PWD/third_party/libero &&
+  python examples/libero/main.py \
+    --args.task-suite-name libero_10 \
+    --args.num-trials-per-task 1 \
+    --args.host 10.191.163.226 --args.port 8000 \
+    --args.video-out-path eval_out/omega_w4a4_smoke
+' > eval_out/omega_w4a4_smoke.log 2>&1 < /dev/null &
+```
+
+先 10 trials 冒烟，确认成功率不离谱再 `--args.num-trials-per-task 50` 全量
+（输出 `eval_out/omega_w4a4_long`）。注意 GptqLinear 是 fake-quant 仿真
+（bf16 稠密 GEMM），本轮只验证精度，不做延迟对照。
+
+---
+
 ## 复现检查清单
 
 - [ ] 延迟：PyTorch BF16 ~137 ms / TRT fp16 ~85.8 ms / TRT FP8+NVFP4 ~49.9 ms
