@@ -39,3 +39,7 @@ export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1   # LIBERO init_states 为老版 torch
 #   pip install -e ".[torch]"
 #   cmake -B build -S . -DGPU_ARCH=110 && cmake --build build -j$(nproc)
 #   bash scripts/download_paligemma_tokenizer.sh
+# LIBERO 仿真依赖（eval_libero.py 用）：
+#   pip install "robosuite==1.4.1" "mujoco==3.2.3" bddl easydict gym matplotlib opencv-python-headless PyOpenGL
+# 上游 [torch] extra 漏装的（pipeline_rtx.py 无条件 import ml_dtypes；tqdm 在 [eval]）：
+#   pip install ml_dtypes tqdm

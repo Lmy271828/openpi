@@ -132,24 +132,27 @@ bash scripts/download_paligemma_tokenizer.sh
 **FlashRT 复现（Thor 同进程：模型 + 仿真同一 venv）**，完整流程：
 
 ```bash
-# ===== 本地 x86 侧：同步 libero 仓库到 Thor（一次性）=====
+# ===== 本地 x86 侧（一次性）：同步 libero 仓库到 Thor =====
 rsync -avz --exclude=.git ~/pynoob/openpi/third_party/libero hcclab@10.191.163.226:~/lmy/openpi/third_party/
 
 # ===== Thor 侧 =====
-cd ~/lmy/openpi/third_party/flashrt
-source ~/lmy/openpi/deployment_scripts/thor_jp72_env.sh
+cd ~/lmy/openpi
+git pull --recurse-submodules          # 拿到 deployment_scripts/thor_jp72_env.sh
+source deployment_scripts/thor_jp72_env.sh   # 激活 venv + LD_LIBRARY_PATH + PYTHONPATH(libero) + TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD
+cd third_party/flashrt
 
 # 验证环境
-python -c "import flash_rt, numpy, torch; print(flash_rt.__version__, numpy.__version__, torch.__version__, torch.cuda.is_available())"
+python -c "import flash_rt, torch; print(flash_rt.__version__, torch.__version__, torch.cuda.is_available())"
 
 # tokenizer（已存在则跳过）
 ls ~/.cache/openpi/big_vision/paligemma_tokenizer.model 2>/dev/null || bash scripts/download_paligemma_tokenizer.sh
 
-# 仿真最小依赖（PYTHONPATH 已由 thor_jp72_env.sh 设置，子进程会继承）
-pip install "robosuite==1.4.1" "mujoco==3.2.3" bddl easydict gym opencv-python-headless PyOpenGL
+# 仿真最小依赖（版本与 x86 client 侧对齐；libero 本体走 PYTHONPATH，不 pip 安装）
+pip install "robosuite==1.4.1" "mujoco==3.2.3" bddl easydict gym matplotlib opencv-python-headless PyOpenGL
+pip install ml_dtypes tqdm   # 上游 [torch] extra 漏装：pipeline_rtx.py 无条件 import ml_dtypes
 python -c "from libero.libero import benchmark; print('libero ok')"
 
-# LIBERO 路径配置（Thor 侧直接写入；注意 init 目录名是 init_files，层级为 libero/libero/libero）
+# LIBERO 路径配置（注意：init 目录名是 init_files，层级为 libero/libero/libero）
 cat > ~/.libero/config.yaml <<'EOF'
 assets: /home/hcclab/lmy/openpi/third_party/libero/libero/libero/./assets
 bddl_files: /home/hcclab/lmy/openpi/third_party/libero/libero/libero/./bddl_files
@@ -163,20 +166,20 @@ python examples/thor/eval_libero.py \
   --checkpoint ~/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch \
   --task_suite libero_10 --quick
 
-# 全量（10 任务 x 50 episodes，FP8；对照臂 C = 80.0%，官方参考 92.6-93%）
+# 全量 FP8（10 任务 x 50 episodes；对照臂 C = 80.0%，官方参考 92.6-93%）
 setsid nohup python examples/thor/eval_libero.py \
   --checkpoint ~/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch \
   --task_suite libero_10 \
   > eval_flashrt_fp8_libero10.log 2>&1 < /dev/null &
 
-# NVFP4 变体（加 --use_fp4）
+# 查进度
+tail -5 eval_flashrt_fp8_libero10.log
+
+# FP8 跑完后再跑 NVFP4 变体（两个全量不要同时跑，避免抢 GPU）
 setsid nohup python examples/thor/eval_libero.py \
   --checkpoint ~/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch \
   --task_suite libero_10 --use_fp4 \
   > eval_flashrt_nvfp4_libero10.log 2>&1 < /dev/null &
-
-# 查进度
-tail -5 eval_flashrt_fp8_libero10.log
 ```
 
 结果写入 `libero_libero_10_torch_results.json`（逐任务成功率 + P50 延迟）。max steps 口径与 openpi client 一致（libero_10 = 520 步/episode），成功率可直接对比。
@@ -186,6 +189,6 @@ tail -5 eval_flashrt_fp8_libero10.log
 - [x] 三臂归因 + 探针失败模式分析（analysis.md）
 - [x] LIBERO-Plus 鲁棒性配对（A 81.4% / C 64.3%）
 - [x] 自定义时间网格注入（`PI05_T_GRID`）
-- [ ] 两步调度免训练冒烟（libero_10 × 10 trials/档）
+- [x] 两步调度免训练评测（libero_10 ×500：50.4% vs 基线 91.6%，证否，见 analysis.md）
 - [ ] off-manifold LoRA 修正器训练（基 U 预计算 + 校准集构建）
 - [ ] FlashRT FP8 W8A8 静态 scale / NVFP4+AWQ 复现（third_party/flashrt）

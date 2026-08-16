@@ -327,6 +327,57 @@ McNemar 配对检验：
 3. **A成C败的 44 个任务高度集中于"阈值敏感三兄弟"的纹理变体**：LIVING_ROOM_SCENE5（task4 双杯放盘，5 个）、SCENE6（task6 杯+布丁，3 个）、KITCHEN_SCENE6（task9 微波炉，2 个）——与干净环境下 task4/9/6 主导掉点的格局一致，量化损伤的任务谱在扰动下没有漂移，只是被放大。
 4. **部署含义**：TRT FP8/NVFP4 的量化配方不仅掉基准成功率，还**显著削弱分布外鲁棒性**——实机环境必然偏离训练纹理/光照分布，-17.1%（而非 -11.6%）才是真实部署预期的掉点量级。量化配方优化（混合精度、AWQ、静态 scale）的验收标准应包含 Plus 子集，而不只是干净 libero_10。
 
+## 免训练两步调度实证：NFE=2 在 π0.5 上不成立（sched_2step_armA，2026-08-15）
+
+动机：Much Ado About Noising 的 MIP（两步推理：t=0.4 免训练单跳 Δt=1 + t=0.9 修正步）与 Table 19 "Sudeep-DiT NFE=3 饱和"暗示少步推理有戏；π0.5 的 action expert 同为 adaLN 调制的 DiT 风格。通过 `PI05_T_GRID="0.6:-1.0;0.1:-0.1:0.9"` 在臂 A（BF16）上做推理侧重网格化（NFE=2），libero_10 × 50 trials = 500 条，与 N=10 基线同规格配对。
+
+| task | N=10 基线 | 2 步调度 | Δ |
+|---|---|---|---|
+| 0 soup+sauce→basket | 96% | 62% | -34p |
+| 1 cheese+butter→basket | 98% | 78% | -20p |
+| 2 stove+moka pot | 94% | 56% | -38p |
+| 3 bowl→drawer | 98% | 70% | -28p |
+| 4 双杯分盘 | 98% | 40% | **-58p** |
+| 5 book→caddy | 100% | 52% | -48p |
+| 6 mug+pudding | 90% | 48% | -42p |
+| 7 soup+cheese→basket | 94% | 58% | -36p |
+| 8 双 moka pot 上灶 | 60% | **6%** | **-54p** |
+| 9 杯入微波炉关门 | 88% | 34% | **-54p** |
+| **整体** | **91.6%** | **50.4%** | **-41.2p** |
+
+结论：
+
+1. **免训练的两步 MIP 调度在 π0.5 上是显著负收益**（-41.2p，n=500 无统计悬念）。与 Much Ado 的机制一致：MIP 的收益来自**训练**（第二步带随机性注入专门学过修正，Table 16 里无匹配训练结构的少步变体 SF/RR 同样吃不到迭代红利），只做推理侧时间网格变换得不到流形投影能力。
+2. **伤害集中在精度敏感任务**：task4/8/9（放置精度窗口最小的三个，也是量化掉点的重灾区）掉 54-58p，宽松任务（task1）只掉 20p。少步去噪削弱的正是"精修/流形吸附"能力——与量化损伤的任务谱高度重合（task4/8/9 同为两类扰动的最敏感点），进一步支持"off-manifold 余量"是统一解释框架。
+3. **对路线的含义**：NFE=2 要成立，第二步必须是**训出来的修正器**（如 off-manifold LoRA 方案，见 README-zh §2），而不是网格技巧。Table 19 的架构依赖信号（DiT NFE=3 饱和）在 π0.5 上未复现——π0.5 的 NFE 敏感点比 20M 小模型 DiT 靠前。若未来再扫，有意义的档位是 NFE=3~4 + 修正器训练，而非继续免训练网格。
+4. 数据存档：`eval_out/sched_2step_armA/`（500 条 rollout 视频）+ `eval_out/sched_2step_armA.log`。
+
+## FlashRT P1/P2 复现：FP8/NVFP4 零掉点，TRT 掉点判为配方问题（2026-08-16）
+
+FlashRT（Thor 原生，torch 2.11 cu130 + 手写 kernel，FP8 E4M3 per-tensor 校准，norm/residual/attention 保持 FP16，覆盖 SigLIP encoder + Gemma decoder + action expert 三侧；NVFP4 档 = FP8 主体 + encoder FFN 换 NVFP4）跑 libero_10 × 50 trials = 500 条，与臂 A/C 同任务不同评测栈（同进程仿真，种子序列不同，只能逐任务比率对照，n=50 单任务噪声 ±7p）：
+
+| task | A (BF16) | C (TRT FP8/NVFP4) | FlashRT FP8 | FlashRT NVFP4 |
+|---|---|---|---|---|
+| 0 | 96 | 92 | 94 | 96 |
+| 1 | 98 | 92 | 100 | 100 |
+| 2 | 94 | 82 | 96 | 92 |
+| 3 | 98 | 86 | 98 | 100 |
+| 4 双杯分盘 | 98 | **46** | 98 | **100** |
+| 5 | 100 | 92 | 98 | 100 |
+| 6 | 90 | 76 | 88 | 86 |
+| 7 | 94 | 94 | 98 | 100 |
+| 8 双 moka pot | 60 | 80* | 52 | 60 |
+| 9 微波炉 | 88 | 60 | 94 | 92 |
+| **整体** | **91.6** | **80.0** | **91.6** | **92.6** |
+
+结论：
+
+1. **FP8 本身不掉点**：FlashRT FP8 = 91.6% 与臂 A 完全持平。臂 C 的 -11.6% 归因为 TRT 量化配方（校准集/scales/Dyna 动态量化），而非 FP8 精度上限。
+2. **NVFP4 也不掉点**：92.6%（甚至 +1.0p 于基线，噪声内），官方"NVFP4 与 FP8 精度持平"复现成立。FlashRT NVFP4 官方延迟 27.17ms（2-view）——若实测延迟成立，则臂 C 的 TRT 方案（49.9ms / 80.0%）被双向超越，整条判负。
+3. **精度敏感任务完全恢复**：task4（46→98/100）和 task9（60→94/92）这两个 TRT 重灾区在 FlashRT 下回到基线水平，与探针结论闭环——落点漂移/关门不到位是 TRT 配方引入的 off-manifold 偏移，不是 FP8/FP4 的固有损伤。
+4. **task8 四方数字（60/80/52/60）互相矛盾**，是固有高方差任务，不作为精度判据。
+5. 数据存档：Thor `~/lmy/openpi/third_party/flashrt/eval_flashrt_{fp8,nvfp4}_libero10.log` + `libero_libero_10_torch_results.json`。注意 `--use_fp4` 是后补的 flag（本地补丁透传 `load_model(use_fp4=)`，见 `examples/thor/eval_libero.py` 未提交改动）。
+
 ## 后续行动
 
 - [x] 看 task4 的 failure 模式（探针复测：80% 失败为 3-5cm 擦边偏心，见上节）
