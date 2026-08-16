@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import math
 import os
@@ -21,6 +22,20 @@ def get_safe_dtype(target_dtype, device_type):
         if target_dtype == torch.float64:
             return torch.float64
     return target_dtype
+
+
+def _dit_step_context(step: int, total: int):
+    """Per-denoise-step context for Omega-QVLA per-step quant scales.
+
+    When gr00t (Omega-QVLA) is importable, GptqLinear layers carrying a
+    per-step act_scale_table read the current step via a ContextVar; without
+    it this is a no-op and those layers fall back to the step-mean scale.
+    """
+    try:
+        from gr00t.quantization.dit_step_context import set_dit_quant_step
+    except ImportError:
+        return contextlib.nullcontext()
+    return set_dit_quant_step(step, total=total)
 
 
 def create_sinusoidal_pos_embedding(
@@ -427,19 +442,22 @@ class PI0Pytorch(nn.Module):
 
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        step_idx = 0
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
-            v_t = self.denoise_step(
-                state,
-                prefix_pad_masks,
-                past_key_values,
-                x_t,
-                expanded_time,
-            )
+            with _dit_step_context(step_idx, num_steps):
+                v_t = self.denoise_step(
+                    state,
+                    prefix_pad_masks,
+                    past_key_values,
+                    x_t,
+                    expanded_time,
+                )
 
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t
             time += dt
+            step_idx += 1
         return x_t
 
     def denoise_step(

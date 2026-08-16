@@ -415,10 +415,23 @@ Omega-QVLA 是 openpi 的**兄弟目录独立克隆，不进 submodule**：
 - 不进 submodule 的原因：不改它的源码（只调用），且 `packs_hf/` 里的 GPTQ pack
   （`pi05_long/quantized.pt`，数百 MB）来自 HF 下载，不入 git
 - 集成方式：整个目录挂进 openpi 容器 `/opt/omega`，靠 `PYTHONPATH` + `GR00T_*`
-  环境变量生效，**openpi 代码零改动**。`scripts/openpi_inference_service.py`
+  环境变量生效。`scripts/openpi_inference_service.py`
   是标准 openpi websocket server，启动时给 `policy._model` 套量化 Linear：
   action expert 用预构建 GPTQ pack（W4A4 + svd_hadamard + per-step scale 表，
   按 10 步 denoise 构建），PaliGemma 主干用 DuQuant 运行时校准（前 ~32 batch 收 scale）
+- openpi 侧唯一改动：`src/openpi/models_pytorch/pi0_pytorch.py` 的
+  `sample_actions` 循环进入 `gr00t.quantization.dit_step_context.set_dit_quant_step(t)`
+  （guarded import，无 Omega-QVLA 时为 no-op）。不打这个补丁则 per-step scale 表
+  不生效，GptqLinear 退化为 step-mean scale——Omega-QVLA 官方的 pack 构建和评测
+  都依赖他们本地打过补丁的 openpi，仓库里没有携带该补丁
+
+**include 正则必须显式给**（默认值是 GR00T N1.x 的模块名，在 pi0.5 上匹配 0 层，
+且不报错——`enable_gptq_if_configured` 匹配 0 层也返回 True）：
+
+- expert（GPTQ）：`.*paligemma_with_expert\.gemma_expert\.model\.layers\.[0-9]+\..*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj).*`
+- PaliGemma（DuQuant）：`.*paligemma_with_expert\.paligemma\.model\.language_model\.layers\.[0-9]+\..*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj).*`
+- `state_proj`/`action_in_proj`/`action_out_proj`/`time_mlp_*` 小投影层在 A4 下会崩，
+  官方明确排除在 include 之外（上面的正则天然不含它们）
 
 server（Thor 宿主机，先停掉占 GPU 的容器/进程）：
 
@@ -439,10 +452,21 @@ sudo docker run -d --name pi05_server --runtime nvidia \
            export PYTHONPATH=packages/openpi-client/src:src:.:/opt/omega && \
            export GR00T_GPTQ=1 \
                   GR00T_GPTQ_PATH=/opt/omega/packs_hf/pi05_long/quantized.pt \
+                  GR00T_GPTQ_INCLUDE='.*paligemma_with_expert\.gemma_expert\.model\.layers\.[0-9]+\..*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj).*' \
+                  GR00T_GPTQ_WBITS_DEFAULT=4 \
+                  GR00T_GPTQ_ABITS=4 \
+                  GR00T_GPTQ_MISSING=fallback \
+                  GR00T_DUQUANT_INCLUDE='.*paligemma_with_expert\.paligemma\.model\.language_model\.layers\.[0-9]+\..*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj).*' \
                   GR00T_DUQUANT_ROT_MODE=svd_hadamard \
                   GR00T_DUQUANT_PERM_SCORE=weight \
-                  GR00T_GPTQ_MISSING=fallback && \
-           python /opt/omega/scripts/openpi_inference_service.py \
+                  GR00T_DUQUANT_BLOCK=64 \
+                  GR00T_DUQUANT_BLOCK_OUT=64 \
+                  GR00T_DUQUANT_PERMUTE=1 \
+                  GR00T_DUQUANT_ROW_ROT=restore \
+                  GR00T_DUQUANT_ACT_PCT=99.9 \
+                  GR00T_DUQUANT_CALIB_STEPS=32 \
+                  GR00T_DUQUANT_LS=0.15 && \
+           python -u /opt/omega/scripts/openpi_inference_service.py \
              --model_path /root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch \
              --data_config pi05_libero \
              --port 8000"
@@ -450,11 +474,11 @@ sudo docker run -d --name pi05_server --runtime nvidia \
 sudo docker logs -f pi05_server
 ```
 
-启动后必查三项：
+启动后必查三项（`python -u` 保证 print 不被 stdout 缓冲吞掉）：
 
-1. include 名单：日志会列出被套 GptqLinear / DuQuantLinear 的模块。
-   `state_proj`、`action_in_proj`、`action_out_proj`、`time_mlp_*` 小投影层
-   不能在内，否则显式传 `GR00T_GPTQ_INCLUDE` / `GR00T_DUQUANT_INCLUDE` 正则排除
+1. `[GR00T-GPTQ] Matched Linear layers: 126`（expert 18 层 × 7 投影）且
+   `[GR00T-DUQUANT] Matched Linear layers: 126`（PaliGemma 18 层 × 7 投影）；
+   是 0 就是正则没匹配上，量化没生效
 2. denoise 步数必须 10（pack 的 per-step scale 表按 10 步建）
 3. 前 ~32 次推理在收 DuQuant 校准 scale，确认校准完成再发评测流量
 
