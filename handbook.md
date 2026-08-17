@@ -501,6 +501,104 @@ setsid nohup bash -c '
 （输出 `eval_out/omega_w4a4_long`）。注意 GptqLinear 是 fake-quant 仿真
 （bf16 稠密 GEMM），本轮只验证精度，不做延迟对照。
 
+```bash
+setsid nohup bash -c '
+  source examples/libero/.venv/bin/activate &&
+  export PYTHONPATH=$PYTHONPATH:$PWD/third_party/libero &&
+  python examples/libero/main.py \
+    --args.task-suite-name libero_10 \
+    --args.num-trials-per-task 50 \
+    --args.host 10.191.163.226 --args.port 8000 \
+    --args.video-out-path eval_out/omega_w4a4_long 
+' > eval_out/omega_w4a4_long.log 2>&1 < /dev/null &
+```
+
+### Omega-QVLA × FlashRT E0M3（M2：fake-quant 换 tcgen05 kernel）
+
+把 GptqLinear 的 fake-quant matmul 换成 FlashRT E0M3 真 kernel（转换产物 +
+消费层，格式与设计见 `third_party/flashrt/docs/omega_pack_e0m3.md`）。
+前置：artifact `pi05_long_e0m3.pt` 已在 Thor `third_party/flashrt/` 下
+（转换器产出，见该文档 Reproducing），消费层/入口脚本已 rsync 到 Thor：
+
+```bash
+# 本地执行（迭代期单文件同步；稳定后走 git）
+rsync -avz ~/pynoob/openpi/third_party/flashrt/tools/{omega_e0m3_linear,serve_omega_e0m3}.py \
+  hcclab@10.191.163.226:~/lmy/openpi/third_party/flashrt/tools/
+```
+
+**1. 探路**（容器能否 import 宿主机 venv 构建的 flash_rt_fp4，ABI 验证）：
+
+```bash
+sudo docker run --rm --runtime nvidia \
+  -v "$HOME/lmy/openpi":/workspace \
+  openpi-pi0.5:l4t-jp7.2 \
+  bash -c 'export PYTHONPATH=/workspace/third_party/flashrt && \
+           python -c "import torch; print(\"torch\", torch.__version__, \"cuda\", torch.cuda.is_available()); import flash_rt.flash_rt_fp4 as m; print(\"flash_rt_fp4 OK\")"'
+```
+
+打 `flash_rt_fp4 OK` 才能继续；报 undefined symbol / ABI 错则改走容器内
+`pip install /workspace/third_party/flashrt` 构建。
+
+**2. 起服务**（与 hybrid server 命令只差三处：PYTHONPATH 加 flashrt 仓库根
++ venv site-packages、加 `OMEGA_E0M3_PACK`、python 行换入口脚本）：
+
+```bash
+sudo docker stop pi05_server 2>/dev/null; sudo docker rm pi05_server 2>/dev/null
+
+sudo docker run -d --name pi05_server --runtime nvidia \
+  --cap-add SYS_ADMIN --network host \
+  --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v "$HOME/lmy/openpi":/workspace \
+  -v "$HOME/lmy/Omega-QVLA":/opt/omega \
+  -v "$HOME/.cache/openpi":/root/.cache/openpi \
+  -w /workspace \
+  openpi-pi0.5:l4t-jp7.2 \
+  bash -c "TF_DIR=/usr/local/lib/python3.12/dist-packages/transformers && \
+           cp -r src/openpi/models_pytorch/transformers_replace/* \$TF_DIR/ && \
+           export PYTHONPATH=packages/openpi-client/src:src:.:/opt/omega:/workspace/third_party/flashrt && \
+           export OMEGA_E0M3_PACK=/workspace/third_party/flashrt/pi05_long_e0m3.pt && \
+           export GR00T_GPTQ=1 \
+                  GR00T_GPTQ_PATH=/opt/omega/packs_hf/pi05_long/quantized.pt \
+                  GR00T_GPTQ_INCLUDE='.*paligemma_with_expert\.gemma_expert\.model\.layers\.[0-9]+\..*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj).*' \
+                  GR00T_GPTQ_WBITS_DEFAULT=4 GR00T_GPTQ_ABITS=4 GR00T_GPTQ_MISSING=fallback \
+                  GR00T_DUQUANT_INCLUDE='.*paligemma_with_expert\.paligemma\.model\.language_model\.layers\.[0-9]+\..*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj).*' \
+                  GR00T_DUQUANT_ROT_MODE=svd_hadamard GR00T_DUQUANT_PERM_SCORE=weight \
+                  GR00T_DUQUANT_BLOCK=64 GR00T_DUQUANT_BLOCK_OUT=64 \
+                  GR00T_DUQUANT_PERMUTE=1 GR00T_DUQUANT_ROW_ROT=restore \
+                  GR00T_DUQUANT_ACT_PCT=99.9 GR00T_DUQUANT_CALIB_STEPS=32 GR00T_DUQUANT_LS=0.15 && \
+           python -u /workspace/third_party/flashrt/tools/serve_omega_e0m3.py \
+             --model_path /root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch \
+             --data_config pi05_libero --port 8000"
+
+sudo docker logs -f pi05_server
+```
+
+启动后必查三项：
+
+1. `[OMEGA-E0M3] installed: artifact=... (252 layers)`——monkeypatch 生效
+2. `[GR00T-GPTQ][REPLACED] ...` 照常打印（wrap 流程不变，换的是类）
+3. 默认只换 expert（GPTQ 侧），PaliGemma 仍 DuQuant fake-quant——有意的
+   半场对照；`OMEGA_E0M3_PATCH_DUQUANT=1` 才双侧全换
+
+**3. 冒烟**（client 同臂 A 入口，只改输出目录；对照基准：
+omega_w4a4_smoke 9/10，且每集耗时应显著低于 fake-quant 的 ~148s）：
+
+```bash
+cd ~/pynoob/openpi
+setsid nohup bash -c '
+  source examples/libero/.venv/bin/activate &&
+  export PYTHONPATH=$PYTHONPATH:$PWD/third_party/libero &&
+  python examples/libero/main.py \
+    --args.task-suite-name libero_10 \
+    --args.num-trials-per-task 1 \
+    --args.host 10.191.163.226 --args.port 8000 \
+    --args.video-out-path eval_out/omega_e0m3_smoke
+' > eval_out/omega_e0m3_smoke.log 2>&1 < /dev/null &
+```
+
+成功率不离谱且延迟下降后，`--args.num-trials-per-task 50` 全量
+（输出 `eval_out/omega_e0m3_long`），与臂 A（91.6%）/ 臂 D（93.2%）
+逐集配对。
 ---
 
 ## 复现检查清单
@@ -510,8 +608,9 @@ setsid nohup bash -c '
 - [ ] `numsteps_sweep_*.csv` 线性拟合 T_fixed / T_step 分解
 - [ ] tegrastats EMC% 分阶段表（warmup / inference_test）
 - [ ] nsys GPU metrics 分阶段饱和度（SMs Active / SM Issue / Tensor Active × prefill / expert）
-- [ ] libero_10 三臂成功率：A ~91.6% / B ~93.0% / C ~80.0%（各 500 episodes）
-- [ ] LIBERO-Plus 子集：A ~81.4% / C ~64.3%（各 210 episodes）
+- [ ] libero_10 三臂成功率：A ~91.6% / B ~93.0% / C ~80.0%（各 500 episodes）；
+  臂 D（Omega W4A4）~93.2%；臂 D+E0M3 kernel（待测，验收 ≥ 臂 A）
+- [ ] LIBERO-Plus 子集：A ~81.4% / C ~64.3% / D ~76.7%（各 210 episodes）
 
 ---
 

@@ -42,6 +42,11 @@ class WebsocketPolicyServer:
             compression=None,
             max_size=None,
             process_request=_health_check,
+            # The policy handler runs torch.compile / CUDA-graph capture
+            # synchronously on first inference, blocking the event loop for
+            # minutes; default keepalive (20s ping/timeout) would drop the
+            # client mid-compile. Harmless on a LAN eval setup.
+            ping_interval=None,
         ) as server:
             await server.serve_forever()
 

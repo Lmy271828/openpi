@@ -392,13 +392,63 @@ FlashRT（Thor 原生，torch 2.11 cu130 + 手写 kernel，FP8 E4M3 per-tensor �
 - 踩坑记录（已固化进 `thor_jp72_env.sh`）：dsl 4.5.1 下 FA4 编译目标必须显式 `CUTE_DSL_ARCH=sm_101a`（`sm_110a` 路径触发 NVVM chip-string bug：`Failed translating the module to ISA`）；loader 的 `setdefault` 在 `import cutlass` 之后才执行，依赖它不可靠，必须进程启动前 export。harness 还要求 flashrt 工作区干净，本地 `--use_fp4` 补丁需先 `git stash`。
 - 存档：Thor `third_party/flashrt/bench_fa4_e2e_2v.log`，artifacts `/tmp/flashrt-pi05-decoder-fp4-e2e-20260816T065142Z`。
 
+## 臂 D（Omega-QVLA W4A4/W4A8 hybrid）：93.2%，与 BF16 基线无统计差异（2026-08-17）
+
+Omega-QVLA 官方配方复现：expert 18 层 ×7 Linear 走 GPTQ W4A4（`a2lite` pack，INT4-only 路径），PaliGemma 18 层 ×7 Linear 走 DuQuant W4A8（block 64×64、svd_hadamard、percentile），小投影层（state/action/time）全部排除；pack = `packs_hf/pi05_long/quantized.pt`。Thor hybrid server（PyTorch 路径，GptqLinear/DuQuantLinear），libero_10 × 50 trials = 500 集，与臂 A 同 client 栈同种子序列逐集配对（`eval_out/omega_w4a4_long.log`）。
+
+| task | A (BF16) | C (TRT FP8/NVFP4) | FlashRT NVFP4 | **D (Omega W4A4)** |
+|---|---|---|---|---|
+| 0 | 96 | 92 | 96 | 90 |
+| 1 | 98 | 92 | 100 | 96 |
+| 2 | 94 | 82 | 92 | 96 |
+| 3 | 98 | 86 | 100 | 96 |
+| 4 双杯分盘 | 98 | **46** | 100 | **100** |
+| 5 | 100 | 92 | 100 | 100 |
+| 6 | 90 | 76 | 86 | **100** |
+| 7 | 94 | 94 | 100 | 100 |
+| 8 双 moka pot | 60 | 80* | 60 | 76 |
+| 9 微波炉 | 88 | 60 | 92 | 78 |
+| **整体** | **91.6** | **80.0** | **92.6** | **93.2** |
+
+结论：
+
+1. **W4A4 也可以不掉点**：93.2% vs 臂 A 91.6%，McNemar 逐集配对（A成D败 21 : A败D成 29）p = 0.32，无统计差异。至此"位宽 vs 配方"的二轮对照闭环：臂 C 的 -11.6% 曾让 FP8/NVFP4 蒙冤，FlashRT 证明了 8/4-bit 静态量化可以零掉点；臂 D 进一步证明**更激进的 W4A4（GPTQ+DuQuant，带校准配方）同样可以零掉点**——掉点从来不是位宽的锅，是配方的锅。
+2. **重灾区完全恢复**：task4 100%（臂 C 46%）、task6 100%（臂 C 76%）；task9 78% 略低于基线 88% 但在 n=50 噪声内。GPTQ 的逐层误差最小化 + DuQuant 的旋转/置换确实把 off-manifold 偏移压回了决策余量之内。
+3. **代价在延迟侧（未测）**：本次只评精度。GptqLinear/DuQuantLinear 是 PyTorch 算子路径（启动日志可见 dynamo graph break 与逐层替换），无 kernel 级加速，Thor 上的推理延迟大概率显著高于 FlashRT NVFP4 的 27.2ms——这正是 fork FlashRT 补"GPTQ pack 消费层"的动机：把同样的量化权重搬到 tcgen05 E0M3 GEMM 上跑。
+4. **配方档位已确认**：Thor 上 `pi0_pytorch.py` 含 `_dit_step_context` 补丁（line 27/448），per-step scale 表生效，本次 93.2% 对应 Omega-QVLA 完整官方配方（非 step-mean fallback）。
+5. 存档：本地 `eval_out/omega_w4a4_long.log` + `eval_out/omega_w4a4_long/`（500 条 rollout 视频）；冒烟 10 集 9/10（`omega_w4a4_smoke.log`）。
+
+## 臂 D × LIBERO-Plus：扰动鲁棒性基本恢复，纹理/光照有残余（2026-08-17）
+
+臂 D（Omega-QVLA W4A4/W4A8 hybrid，同臂 A/C 的 210 任务子集逐集配对，`eval_out/plus_armD.log`）：**161/210 = 76.7%**，对照臂 A 81.4% / 臂 C 64.3%。McNemar：A vs D = 21:11，**p = 0.11（无统计差异）**；C vs D = 11:37，**p = 2.2e-04（D 显著优于 C）**。
+
+逐维度（每维度 n=30；A:D 配对比 = A成D败 : A败D成）：
+
+| 维度 | A | C | **D** | A:D 配对比 | 判读 |
+|---|---|---|---|---|---|
+| Background Textures | 97% | **50%** | **83%** | 4:0 | C 的最大交互重灾区基本收复，仍有轻微残余敏感 |
+| Robot Initial States | 77% | 50% | **67%** | 4:1 | 同上，次重灾区大部分收复 |
+| Language Instructions | 97% | 87% | **97%** | 0:0 | 完全恢复 |
+| Light Conditions | 100% | 87% | **87%** | 4:0 | **未恢复**——D 与 C 持平，是残余掉点之一 |
+| Objects Layout | 83% | 70% | 80% | 3:2 | 回到 A 的水平 |
+| Sensor Noise | 67% | 60% | 70% | 4:5 | 回到 A 的水平 |
+| Camera Viewpoints | 50% | 47% | 53% | 2:3 | 无差异（地板效应维度） |
+
+结论：
+
+1. **好配方不仅救基准，也救鲁棒性**：臂 C 的 -17.1%（扰动下放大的量化掉点）在臂 D 收窄到 -4.7%，且与 A 无统计差异。"量化 × 扰动交互"不是位宽的固有代价，与干净环境的结论同构——是 TRT 配方的问题。
+2. **但残余信号值得记录**：Textures（4:0）和 Light（4:0）两个维度 D 仍方向性低于 A（n=30 不足以定统计显著，但两个维度同向）。off-manifold 框架下这合理：W4A4 的纠错余量恢复得"几乎够"，纹理/光照这两个最依赖视觉表征余量的维度先用完了余量。若未来做混合精度精修，这两个维度是敏感指标。
+3. **部署含义更新**：之前"实机预期掉点 -17.1%"的悲观估计是针对 TRT 配方的；以臂 D 为部署基线，扰动环境预期掉点约 **-5% 量级**。量化方案的验收标准仍应包含 Plus 子集（它能暴露干净环境看不见的残余损伤，如本次的 Light 维度）。
+4. 存档：`eval_out/plus_armD.log` + `eval_out/libero_plus_armD/`（210 条视频）；每集 ~148s（vs 臂 A ~90s），W4A4 PyTorch 路径的延迟劣势直接可见，量化 kernel 化（FlashRT E0M3 迁移）是必要后续。
+
 ## 后续行动
 
 - [x] 看 task4 的 failure 模式（探针复测：80% 失败为 3-5cm 擦边偏心，见上节）
 - [x] LIBERO-Plus 臂 A（81.4%，维度排序：相机位姿 50% 最脆弱，光照/背景/语言免疫，见上节）
 - [x] LIBERO-Plus 臂 C 同子集 + 逐任务配对（64.3%，p=4.0e-07；Background Textures 97→50% 是最大交互维度，见上节）
 - [x] [切 C server] task4 带符号探针 + task9 探针（各 50 集）：task4 偏移定向（黄白杯 -y 2.1→4.0cm）；task9 掉点主因是"门没关"（24 失败全部门未关到位，15 个杯已放入），见上节
-- [ ] FlashRT 复现（P1: FP8 on libero_10；P2: NVFP4+AWQ），环境方案见 handbook「FlashRT 复现环境」
+- [x] FlashRT 复现（FP8 91.6% / NVFP4 92.6% 零掉点，FA4 27.21ms 对齐官方，见上两节）
+- [x] Omega-QVLA 臂 D 复现（W4A4/W4A8 hybrid 93.2%，与基线无统计差异，见上节）
 - [ ] TRT：评估 NVFP4 静态 scale / Dyna 算子融合（预期省 ~5-6 ms/次）
 - [ ] 评估 LLM 层与 expert denoise 的层级流水（重叠窗口 3.16 ms/step）
 - [ ] （可选）提高 tegrastats 采样率（--tegrastats-interval 20~50 ms）以加密 test 阶段 EMC 样本，当前 7/3 个样本只够看量级
