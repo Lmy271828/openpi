@@ -589,8 +589,8 @@ sudo docker logs -f pi05_server
 
 1. 前置 `docker stop/rm || true`——幂等重启，不用手清旧容器
 2. `set -euo pipefail`——起失败立即非零退出
-3. `OMEGA_E0M3_CUDA_GRAPH=${OMEGA_E0M3_CUDA_GRAPH:-0}` 透传——前缀
-   赋值即抓图模式（M2d，见 `tools/omega_e0m3_graph.py`）
+3. `OMEGA_E0M3_CUDA_GRAPH=${OMEGA_E0M3_CUDA_GRAPH:-1}` 透传——默认开
+   （50 集 45/50 = 90.0% ≈ eager 基线 90.4%，已验收），显式 `=0` 回 eager
 4. 不带 `logs -f`——日志单独 `sudo docker logs -f pi05_server`
 5. mount 源用 `OPENPI_ROOT`/`OMEGA_ROOT`/`OPENPI_CACHE` 变量，默认
    `$HOME/lmy/...` 布局
