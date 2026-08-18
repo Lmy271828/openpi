@@ -573,12 +573,41 @@ sudo docker run -d --name pi05_server --runtime nvidia \
 sudo docker logs -f pi05_server
 ```
 
+**2b. 一键脚本 `tools/start_e0m3_server.sh`**（在 fork 仓库内，进 git、
+随 rsync 同步——取代早期散落在 Thor home 的 `~/start_e0m3_server.sh`，
+后者可删）。路径从脚本自身位置推算，布局不同可用 env 覆盖
+（`OPENPI_ROOT` / `OMEGA_ROOT` / `OPENPI_CACHE`）：
+
+```bash
+# Thor 上（rsync 或 git pull 之后）
+bash ~/lmy/openpi/third_party/flashrt/tools/start_e0m3_server.sh
+OMEGA_E0M3_CUDA_GRAPH=1 bash ~/lmy/openpi/third_party/flashrt/tools/start_e0m3_server.sh  # 抓图模式
+sudo docker logs -f pi05_server
+```
+
+与 §2 裸命令的差异（docker run 本体逐字相同）：
+
+1. 前置 `docker stop/rm || true`——幂等重启，不用手清旧容器
+2. `set -euo pipefail`——起失败立即非零退出
+3. `OMEGA_E0M3_CUDA_GRAPH=${OMEGA_E0M3_CUDA_GRAPH:-0}` 透传——前缀
+   赋值即抓图模式（M2d，见 `tools/omega_e0m3_graph.py`）
+4. 不带 `logs -f`——日志单独 `sudo docker logs -f pi05_server`
+5. mount 源用 `OPENPI_ROOT`/`OMEGA_ROOT`/`OPENPI_CACHE` 变量，默认
+   `$HOME/lmy/...` 布局
+
 启动后必查三项：
 
 1. `[OMEGA-E0M3] installed: artifact=... (252 layers)`——monkeypatch 生效
 2. `[GR00T-GPTQ][REPLACED] ...` 照常打印（wrap 流程不变，换的是类）
 3. 默认只换 expert（GPTQ 侧），PaliGemma 仍 DuQuant fake-quant——有意的
    半场对照；`OMEGA_E0M3_PATCH_DUQUANT=1` 才双侧全换
+
+抓图模式（`OMEGA_E0M3_CUDA_GRAPH=1`）再加一项：
+
+4. `sudo docker logs pi05_server 2>&1 | grep "OMEGA-E0M3] cuda graph"`——
+   期望 `installed` → 首次推理时 `captured (prefix_len=968, layers=18,
+   steps=10)`；出现 `DISABLED (...), eager fallback` 则捕获失败已回退
+   eager，把括号里的异常贴回来排查
 
 **3. 冒烟**（client 同臂 A 入口，只改输出目录；对照基准：
 omega_w4a4_smoke 9/10，且每集耗时应显著低于 fake-quant 的 ~148s）：
@@ -609,7 +638,7 @@ setsid nohup bash -c '
 - [ ] tegrastats EMC% 分阶段表（warmup / inference_test）
 - [ ] nsys GPU metrics 分阶段饱和度（SMs Active / SM Issue / Tensor Active × prefill / expert）
 - [ ] libero_10 三臂成功率：A ~91.6% / B ~93.0% / C ~80.0%（各 500 episodes）；
-  臂 D（Omega W4A4）~93.2%；臂 D+E0M3 kernel（待测，验收 ≥ 臂 A）
+  臂 D（Omega W4A4）~93.2%；臂 D+E0M3 kernel ~90.4%（vs A p=0.53 / vs D p=0.07）
 - [ ] LIBERO-Plus 子集：A ~81.4% / C ~64.3% / D ~76.7%（各 210 episodes）
 
 ---

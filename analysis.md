@@ -441,6 +441,33 @@ Omega-QVLA 官方配方复现：expert 18 层 ×7 Linear 走 GPTQ W4A4（`a2lite
 3. **部署含义更新**：之前"实机预期掉点 -17.1%"的悲观估计是针对 TRT 配方的；以臂 D 为部署基线，扰动环境预期掉点约 **-5% 量级**。量化方案的验收标准仍应包含 Plus 子集（它能暴露干净环境看不见的残余损伤，如本次的 Light 维度）。
 4. 存档：`eval_out/plus_armD.log` + `eval_out/libero_plus_armD/`（210 条视频）；每集 ~148s（vs 臂 A ~90s），W4A4 PyTorch 路径的延迟劣势直接可见，量化 kernel 化（FlashRT E0M3 迁移）是必要后续。
 
+## 臂 D + E0M3 kernel 化（FlashRT tcgen05）：90.4%，与 A/D 均无统计差异，延迟 2.6×（2026-08-18）
+
+同一套 Omega pack（`pi05_long/quantized.pt`）经 `tools/convert_omega_pack_e0m3.py` 转为 `omega_e0m3_v1`（S0 丢表），由 `tools/omega_e0m3_linear.py` 消费层把 expert 126 层 Linear 换到 FlashRT E0M3 kernel（per-16 动态量化 + tcgen05 GEMM），PaliGemma 侧仍走 DuQuant fake-quant；eager + 禁 torch.compile（pybind graph break + KV recompile 风暴，见 handbook）。libero_10 × 50 trials = 500 集逐集配对（`eval_out/omega_e0m3_long.log`）。
+
+| task | A (BF16) | D (fake-quant) | **D+E0M3** |
+|---|---|---|---|
+| 0 | 96 | 90 | 98 |
+| 1 | 98 | 96 | 98 |
+| 2 | 94 | 96 | 96 |
+| 3 | 98 | 96 | 94 |
+| 4 双杯分盘 | 98 | **100** | 98 |
+| 5 | 100 | 100 | 100 |
+| 6 | 90 | **100** | 94 |
+| 7 | 94 | 100 | 100 |
+| 8 双 moka pot | 60 | 76 | 66 |
+| 9 微波炉 | 88 | 78 | **60** |
+| **整体** | **91.6** | **93.2** | **90.4** |
+
+McNemar（逐集配对）：vs 臂 A = 28:34，**p = 0.53（无差异）**；vs 臂 D = 19:33，**p = 0.070（无统计差异，方向偏负）**。
+
+结论：
+
+1. **kernel 化不显著掉点，但吃掉了臂 D 的余量**：E0M3（S0 丢校准表 + per-16 动态 amax）对比带表的 fake-quant 掉了 2.8 个点，未达统计显著（p=0.07），判定为"等价于基线、略逊于完整配方"。单层 cos（0.978-0.982）预言的二阶损失在端到端被部分放大。
+2. **task9（微波炉）是唯一重灾区**：60% vs 臂 A 88% / 臂 D 78%。与臂 C 时代 task4/task9 的敏感性同构——长horizon精细任务最先耗尽量化余量。若做精修（混合精度/带表 S1 修复版），task9 是敏感指标。
+3. **延迟收益兑现**：每集 ~58s vs 臂 D fake-quant ~148s（**2.6×**），vs 臂 A ~90s。expert 占单步延迟的主体（trtexec 归因 51.7%），E0M3 GEMM + eager 已拿下大部分；剩余 gap 在 eager launch 开销，对应 CUDA Graph 自抓（M2d）。
+4. 存档：`eval_out/omega_e0m3_long.log` + `eval_out/omega_e0m3_long/`（500 条视频）；冒烟 9/10（`omega_e0m3_smoke.log`）。
+
 ## 后续行动
 
 - [x] 看 task4 的 failure 模式（探针复测：80% 失败为 3-5cm 擦边偏心，见上节）

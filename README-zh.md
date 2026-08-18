@@ -184,6 +184,50 @@ setsid nohup python examples/thor/eval_libero.py \
 
 结果写入 `libero_libero_10_torch_results.json`（逐任务成功率 + P50 延迟）。max steps 口径与 openpi client 一致（libero_10 = 520 步/episode），成功率可直接对比。
 
+## 5.5 FlashRT 代码阅读路径（pi0.5 部分）
+
+面向有 C++ 基础、没写过 CUDA C 的开发者。原则：**从 Python 调用侧往 kernel 侧下沉，每一层只读"它和上下层的接口"，GEMM 内部当黑盒**。四个阶段，每个阶段读完能回答对应的问题就算过：
+
+**阶段 1：Python 前端（纯 Python，无 CUDA）**
+
+- `flash_rt/models/pi05/pipeline_thor.py`（929 行）——Thor 侧 π0.5 推理管线：模型怎么拼装、校准 scale 从哪加载、每个手写 kernel 在 forward 的哪个位置被调用。这是全项目的"地图"。
+- `examples/thor/eval_libero.py` + `tests/bench_pi05_thor_views.py`——管线的两个消费方，看它们怎么传参（`use_fp4` 怎么走通）就知道 API 边界在哪。
+- 读完能回答：一次 denoise step 依次调用了哪些 kernel？FP8/NVFP4 的分支在哪切换？
+
+**阶段 2：第一个 kernel（小、独立、无模板）**
+
+- `csrc/fused_fp4/siglip_ln_vec.cu`（269 行）——SigLIP 的向量化 LayerNorm，项目里最短的手写 kernel 之一。对照 `csrc/fp4_bindings.cpp` 里它的 pybind 注册读，搞清三件事：`__global__`/`__device__` 的分工、grid/block 怎么算、host 侧怎么把 torch tensor 变成 kernel 参数。
+- 读完能回答：一个 CUDA kernel 从 Python 调用到上 GPU 执行的完整链路长什么样？
+
+**阶段 3：融合算子（本项目核心资产）**
+
+- `csrc/fused_fp4/pi05_e0m3_act.cu`（480 行）——激活侧融合 kernel：量化 + RHT（随机 Hadamard 变换）+ UE4M3 block scale 一次过。这是 NVFP4 精度能零掉点的关键之一，也是后续"GPTQ pack 消费层"要对接的激活格式。
+- 读法：先读 `.cuh` 的函数签名和注释搞清楚输入输出契约，再读 `.cu` 主 kernel 的线程分工，RHT 的数学细节可以先当"一个正交变换"跳过。
+- 读完能回答：E0M3 激活 + UE4M3 scale 的内存布局是什么？为什么融合比分开做快？
+
+**阶段 4：GEMM 只读壳（不深入 CUTLASS）**
+
+- `csrc/gemm/fp4/cutlass_fp4_gemm_e0m3w_sm100.cu`（151 行）——E0M3 权重 tcgen05 GEMM 的 host 侧封装。只读它怎么选 CUTLASS 模板、怎么填 descriptor、怎么 launch；`.cuh` 里的 CUTLASS 模板展开和 tcgen05 指令**不要追**，那是另一个数量级的复杂度（等真要写 GEMM 时再回来）。
+- 读完能回答：CUTLASS kernel 的"配置 → 实例化 → launch"三段式长什么样？per-16 block scale 是以什么形式传进 GEMM 的？
+
+辅助材料：仓库根 `README.md` / `USAGE.md` / `docs/`（作者的设计说明）；`perf_data/` 里的 nsys 统计（kernel 名字和 csrc 文件名基本一一对应，可以拿 profile 反查"这个 kernel 实际占多少时间"）。读 kernel 时手边放一份 CUDA C Programming Guide 的 memory model 章节即可，不需要先系统学完 CUDA。
+
+**阶段 5：CUDA Graph runtime（终态形态，M2 后续路线）**
+
+FlashRT 不走 torch.compile，而是自己抓 CUDA Graph：buffer 全部静态持有（地址 capture 后不动）、输入形状分档、每档 warmup 后录制一次、之后整图回放，新数据只就地拷进静态 buffer。与 torch.compile 的区别：录制在驱动层进行、不需要理解 kernel 语义，所以 pybind 黑盒/裸指针随便用；代价是形状和 buffer 地址必须静态。按顺序读：
+
+| 顺序 | 文件 | 看什么 |
+|---|---|---|
+| 1 | `USAGE.md` §Pi0.5 State Prompts（~L130-165） | fixed 模式语义：一图打天下、无 warmup、不重录 |
+| 2 | `docs/architecture.md` | 八大组件全景，graph capture 在 frontend 层的位置 |
+| 3 | `flash_rt/core/cuda_graph.py`（81 行，全读） | 裸机制：ctypes 直调 cudaStreamBeginCapture，框架无关 |
+| 4 | `flash_rt/frontends/torch/pi05_thor_fp4.py`：`_alloc_fp4_scratch_for_Se`(L1103)、`_capture_siglip_graph`(L838)、`_capture_enc_ae_graph`(L1277)、`_fp4_scratch_dict`(L1151) | 真实模型里的 buffer 所有制 + capture 完整姿势 |
+| 5 | `flash_rt/structures/impls/decode_loop/whole_step.py` 的 `_StaticHybridCache`(L31) | KV cache 这种变长结构怎么静态化（预分配最大长度 + 就地更新） |
+| 6 | `tests/test_pi05_state_prompt_fixed_graph.py` | 行为合同测试：什么情况允许重录、什么必须命中旧图 |
+| 7 | `docs/adding_new_model.md` §0 + `docs/exec_contract.md` | 仓库硬规则（PR② 须遵守）+ Buffer/Graph/Plan C ABI |
+
+读完能回答：为什么 CUDA Graph 能绕过 graph break 问题？我们 eager 消费层（`tools/omega_e0m3_linear.py`）要图化缺哪三件事（按 M 分档的持久 buffer、整段 expert forward 一次录制、输入就地拷贝）？
+
 ## 6. 当前进展
 
 - [x] 三臂归因 + 探针失败模式分析（analysis.md）
@@ -191,4 +235,5 @@ setsid nohup python examples/thor/eval_libero.py \
 - [x] 自定义时间网格注入（`PI05_T_GRID`）
 - [x] 两步调度免训练评测（libero_10 ×500：50.4% vs 基线 91.6%，证否，见 analysis.md）
 - [ ] off-manifold LoRA 修正器训练（基 U 预计算 + 校准集构建）
-- [ ] FlashRT FP8 W8A8 静态 scale / NVFP4+AWQ 复现（third_party/flashrt）
+- [x] FlashRT 复现（FP8 91.6% / NVFP4 92.6% 零掉点，NVFP4+FA4 27.21ms；third_party/flashrt，见 analysis.md）
+- [x] Omega-QVLA 臂 D 复现（W4A4/W4A8 hybrid 93.2%，per-step scale 完整配方，见 analysis.md）
