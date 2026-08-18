@@ -468,6 +468,21 @@ McNemar（逐集配对）：vs 臂 A = 28:34，**p = 0.53（无差异）**；vs 
 3. **延迟收益兑现**：每集 ~58s vs 臂 D fake-quant ~148s（**2.6×**），vs 臂 A ~90s。expert 占单步延迟的主体（trtexec 归因 51.7%），E0M3 GEMM + eager 已拿下大部分；剩余 gap 在 eager launch 开销，对应 CUDA Graph 自抓（M2d）。
 4. 存档：`eval_out/omega_e0m3_long.log` + `eval_out/omega_e0m3_long/`（500 条视频）；冒烟 9/10（`omega_e0m3_smoke.log`）。
 
+### M2d：denoise 循环 CUDA Graph 自抓（2026-08-18）
+
+eager 路径的下一步优化：把 10 步 flow-matching denoise 循环（expert 18 层 ×10，~180 层小 kernel）整段展开抓进一张 `torch.cuda.CUDAGraph`（FlashRT pi05_thor 同款形态），实现为 `third_party/flashrt/tools/omega_e0m3_graph.py`——静态 KV slab 套 DynamicCache 壳、mask/position 静态 buffer 每推理 `copy_` 灌入、adaRMS 按确定性时间网格预算烘焙；prefix（ViT+LLM prefill）保持 eager。移除的捕获障碍：device 标量 `while` 循环（每步 host sync）、`embed_suffix` 每步 pageable H2D mask 上传、每调用 KV 重新分配。默认开（`OMEGA_E0M3_CUDA_GRAPH=1`），捕获失败永久回退 eager。
+
+Thor 验收：
+
+| 指标 | eager（M2b/c） | 抓图（M2d） |
+|---|---|---|
+| 捕获 | — | 成功（prefix_len=968, layers=18, steps=10） |
+| 冒烟 | 9/10 | **10/10** |
+| 50 集确认 | — | **45/50 = 90.0%**（≈ 500 集基线 90.4%，无数值漂移） |
+| 每集耗时 | ~58s | **~43-50s**（-15~25%） |
+
+判读：图只消掉 denoise 循环的 launch/host 开销，prefix 仍 eager，故幅度是 ~15-25% 而非数量级——图化只回收 launch/host 开销，kernel 本体耗时不变；这与 nsys 观察一致（GPU 时间大头在 kernel 执行本身）。pybind kernel 可捕获性（M2d P0 gate）一次通过，FlashRT 的"裸指针+stream+launch 时报错"调用约定在第三方模块上同样成立。剩余延迟预算在 prefix 的 ~1200-1800 次 eager launch，下一步候选是 prefix 原样抓图（零数值风险）或学 FlashRT 的 FP8 fused kernel 重写（高收益高成本）。存档：`eval_out/omega_e0m3_graph_smoke.log`（10/10）、`eval_out/omega_e0m3_graph_50.log`（45/50）。
+
 ## 后续行动
 
 - [x] 看 task4 的 failure 模式（探针复测：80% 失败为 3-5cm 擦边偏心，见上节）
