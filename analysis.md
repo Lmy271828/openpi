@@ -464,7 +464,9 @@ McNemar（逐集配对）：vs 臂 A = 28:34，**p = 0.53（无差异）**；vs 
 结论：
 
 1. **kernel 化不显著掉点，但吃掉了臂 D 的余量**：E0M3（S0 丢校准表 + per-16 动态 amax）对比带表的 fake-quant 掉了 2.8 个点，未达统计显著（p=0.07），判定为"等价于基线、略逊于完整配方"。单层 cos（0.978-0.982）预言的二阶损失在端到端被部分放大。
-2. **task9（微波炉）是唯一重灾区**：60% vs 臂 A 88% / 臂 D 78%。与臂 C 时代 task4/task9 的敏感性同构——长horizon精细任务最先耗尽量化余量。若做精修（混合精度/带表 S1 修复版），task9 是敏感指标。
+2. **task9（微波炉）是唯一重灾区**：60% vs 臂 A 88% / 臂 D 78%。与臂 C 时代 task4/task9 的敏感性同构——长horizon精细任务最先耗尽量化余量。后续 actnorm 实验（见下）证明这不是表能救的；若做精修，方向是混合精度（敏感层升 8-bit），task9 是敏感指标。
+
+**actnorm 负结果（2026-08-18）**：为找回 vs 臂 D 的 2.8 个点，试过地板安全版 S1——s̄ 分解为 geomean c × 归一化 r̄，r̄ 折权重（不撞 UE4M3 地板，q_proj 块 scale 越界占比 100%→0%）、激活静态除 s̄、c 吸进 GEMM alpha。数学恒等成立（误差 4e-7），但单层 cos vs fp16 全面劣于 S0（0.986-0.989 vs 0.993-0.994）：折 r̄ 把 DuQuant 已漂白的权重块内幅度重新拉开，激活侧赚的抵不上权重侧亏的。**结论：per-channel 校准表与 per-16 块量化原理不兼容，S0 是终点**；task9 残余差距只能靠混合精度或接受。细节见 `third_party/flashrt/docs/omega_pack_e0m3.md` §4。
 3. **延迟收益兑现**：每集 ~58s vs 臂 D fake-quant ~148s（**2.6×**），vs 臂 A ~90s。expert 占单步延迟的主体（trtexec 归因 51.7%），E0M3 GEMM + eager 已拿下大部分；剩余 gap 在 eager launch 开销，对应 CUDA Graph 自抓（M2d）。
 4. 存档：`eval_out/omega_e0m3_long.log` + `eval_out/omega_e0m3_long/`（500 条视频）；冒烟 9/10（`omega_e0m3_smoke.log`）。
 
