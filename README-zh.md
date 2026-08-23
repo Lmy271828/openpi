@@ -236,4 +236,4 @@ FlashRT 不走 torch.compile，而是自己抓 CUDA Graph：buffer 全部静态�
 - [x] 两步调度免训练评测（libero_10 ×500：50.4% vs 基线 91.6%，证否，见 analysis.md）
 - [ ] off-manifold LoRA 修正器训练（基 U 预计算 + 校准集构建）
 - [x] FlashRT 复现（FP8 91.6% / NVFP4 92.6% 零掉点，NVFP4+FA4 27.21ms；third_party/flashrt，见 analysis.md）
-- [x] Omega-QVLA 臂 D 复现（W4A4/W4A8 hybrid 93.2%，per-step scale 完整配方，见 analysis.md）
+- [x] Omega-QVLA 臂 D 复现（expert pack GPTQ W4A4 + PaliGemma 运行时 DuQuant W4A8 93.2%；Omega 官方 pack 配方实为全模型 W4A4，见 analysis.md）

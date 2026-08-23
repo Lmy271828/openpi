@@ -394,7 +394,7 @@ FlashRT（Thor 原生，torch 2.11 cu130 + 手写 kernel，FP8 E4M3 per-tensor �
 
 ## 臂 D（Omega-QVLA W4A4/W4A8 hybrid）：93.2%，与 BF16 基线无统计差异（2026-08-17）
 
-Omega-QVLA 官方配方复现：expert 18 层 ×7 Linear 走 GPTQ W4A4（`a2lite` pack，INT4-only 路径），PaliGemma 18 层 ×7 Linear 走 DuQuant W4A8（block 64×64、svd_hadamard、percentile），小投影层（state/action/time）全部排除；pack = `packs_hf/pi05_long/quantized.pt`。Thor hybrid server（PyTorch 路径，GptqLinear/DuQuantLinear），libero_10 × 50 trials = 500 集，与臂 A 同 client 栈同种子序列逐集配对（`eval_out/omega_w4a4_long.log`）。
+Omega-QVLA 官方 pack 配方实为全模型 W4A4（README 标题与 HF 仓库名均为 `W4A4`；pack 内 PaliGemma 记录 `a_bits=4`、单行 `act_scale_table`，expert 记录 `a_bits=4`、10 行 per-step 表——2026-08-22 直接读 pack 核实）。本次臂 D 为 hybrid 部署：expert 18 层 ×7 Linear 走 pack GPTQ W4A4（`a2lite` pack，INT4-only 路径，`GptqLinear`），PaliGemma 18 层 ×7 Linear 走运行时 `DuQuantLinear`（启动时从 BF16 权重确定性重建 svd_hadamard 旋转+置换，RTN W4；`GR00T_DUQUANT_ABITS` 未设、取默认 A8），小投影层（state/action/time）全部排除；pack = `packs_hf/pi05_long/quantized.pt`（仅 expert 部分被加载）。Thor hybrid server（PyTorch 路径，GptqLinear/DuQuantLinear），libero_10 × 50 trials = 500 集，与臂 A 同 client 栈同种子序列逐集配对（`eval_out/omega_w4a4_long.log`）。
 
 | task | A (BF16) | C (TRT FP8/NVFP4) | FlashRT NVFP4 | **D (Omega W4A4)** |
 |---|---|---|---|---|
@@ -412,7 +412,7 @@ Omega-QVLA 官方配方复现：expert 18 层 ×7 Linear 走 GPTQ W4A4（`a2lite
 
 结论：
 
-1. **W4A4 也可以不掉点**：93.2% vs 臂 A 91.6%，McNemar 逐集配对（A成D败 21 : A败D成 29）p = 0.32，无统计差异。至此"位宽 vs 配方"的二轮对照闭环：臂 C 的 -11.6% 曾让 FP8/NVFP4 蒙冤，FlashRT 证明了 8/4-bit 静态量化可以零掉点；臂 D 进一步证明**更激进的 W4A4（GPTQ+DuQuant，带校准配方）同样可以零掉点**——掉点从来不是位宽的锅，是配方的锅。
+1. **W4 权重也可以不掉点**：93.2% vs 臂 A 91.6%，McNemar 逐集配对（A成D败 21 : A败D成 29）p = 0.32，无统计差异。至此"位宽 vs 配方"的二轮对照闭环：臂 C 的 -11.6% 曾让 FP8/NVFP4 蒙冤，FlashRT 证明了 8/4-bit 静态量化可以零掉点；臂 D 进一步证明**更激进的 W4 权重（expert GPTQ W4A4 + PaliGemma DuQuant W4A8，带旋转/校准配方）同样可以零掉点**——掉点从来不是位宽的锅，是配方的锅。
 2. **重灾区完全恢复**：task4 100%（臂 C 46%）、task6 100%（臂 C 76%）；task9 78% 略低于基线 88% 但在 n=50 噪声内。GPTQ 的逐层误差最小化 + DuQuant 的旋转/置换确实把 off-manifold 偏移压回了决策余量之内。
 3. **代价在延迟侧（未测）**：本次只评精度。GptqLinear/DuQuantLinear 是 PyTorch 算子路径（启动日志可见 dynamo graph break 与逐层替换），无 kernel 级加速，Thor 上的推理延迟大概率显著高于 FlashRT NVFP4 的 27.2ms——这正是 fork FlashRT 补"GPTQ pack 消费层"的动机：把同样的量化权重搬到 tcgen05 E0M3 GEMM 上跑。
 4. **配方档位已确认**：Thor 上 `pi0_pytorch.py` 含 `_dit_step_context` 补丁（line 27/448），per-step scale 表生效，本次 93.2% 对应 Omega-QVLA 完整官方配方（非 step-mean fallback）。
@@ -485,6 +485,55 @@ Thor 验收：
 
 判读：图只消掉 denoise 循环的 launch/host 开销，prefix 仍 eager，故幅度是 ~15-25% 而非数量级——图化只回收 launch/host 开销，kernel 本体耗时不变；这与 nsys 观察一致（GPU 时间大头在 kernel 执行本身）。pybind kernel 可捕获性（M2d P0 gate）一次通过，FlashRT 的"裸指针+stream+launch 时报错"调用约定在第三方模块上同样成立。剩余延迟预算在 prefix 的 ~1200-1800 次 eager launch，下一步候选是 prefix 原样抓图（零数值风险）或学 FlashRT 的 FP8 fused kernel 重写（高收益高成本）。存档：`eval_out/omega_e0m3_graph_smoke.log`（10/10）、`eval_out/omega_e0m3_graph_50.log`（45/50）。
 
+### 路线 A 落地：双侧 E0M3 + prefix 抓图，action cos 四项过门禁（2026-08-22）
+
+PaliGemma 从运行时 DuQuant（RTN W4 + 默认 A8）切到 pack 的 GPTQ W4A4 记录 + E0M3 kernel（`OMEGA_E0M3_PATCH_DUQUANT=1`，对齐官方全-W4A4 pack 配方），prefix prefill 同步入图（双图结构）。转换器零改动（252 条记录全量转换本就含 PaliGemma）。途中修了两个集成 bug：消费层缺 `_block_size`/`_block_out_size`/`_act_stats_available` 三个宿主日志契约属性，`wrap_duquant` 的记账行直接 AttributeError；harness 的 bf16 子进程在 torch.compile 下 prefix 注意力被 trace 成 SDPA（fp32 mask 撞 bf16 query）——harness 三模式统一改 eager（本来就是 eager 数值信号，与图重放 kernel 序列等价）。
+
+Thor 验收（server 日志）：双侧 252 层全部替换（126 `via GptqLinear` + 126 `via DuQuantLinear`），prefix 图捕获（prefix_len=968, layers=18）+ denoise 图捕获。
+
+action cos（`tools/check_omega_e0m3_action_cos.py`，libero_10 十任务各 1 条观测、同噪声逐条配对，eager）：
+
+| 配对 | action cos | action min | raw cos | raw min |
+|---|---|---|---|---|
+| e0m3 vs bf16（端到端总账） | **0.99940** | **0.99694** | **0.99872** | **0.99512** |
+| fake vs bf16（配方参考线） | 0.99778 | 0.99210 | 0.99577 | 0.98607 |
+| e0m3 vs fake（kernel 纯损耗） | 0.99850 | 0.99374 | 0.99648 | 0.98829 |
+
+e0m3/bf16 四项全过 NVFP4 派生门禁（0.999/0.995/0.995/0.995，raw min 擦线 +0.0001）；臂 D 配方自身（fake/bf16）反而四项全不过——直接印证 pack GPTQ 权重优于运行时 RTN 的设计判断。eager p50：bf16 226ms / fake 561ms / e0m3 548ms——eager 下 launch 开销主导，E0M3 的 GEMM 收益只在图重放路径体现（与 M2d 判读一致）。冒烟 10/10（7m36s，每集 26.7-84.8s）。存档：`eval_out/action_cos_routeA/`（result.json + 三模式子进程日志）、`eval_out/omega_routeA_long.log`（冒烟与全量共用此文件，全量见下节）。
+
+### 路线 A ×500 全量：93.8%，与臂 A/D 无统计差异，显著优于 expert-only E0M3（2026-08-23）
+
+libero_10 × 50 trials = 500 集逐集配对（`eval_out/omega_routeA_long.log`；文件名沿用冒烟时的命名，视频目录 `omega_routeA_long/` 混有前 10 集冒烟视频）。
+
+| task | A (BF16) | D (fake-quant) | D+E0M3（expert-only） | **路线 A（双侧）** |
+|---|---|---|---|---|
+| 0 | 96 | 90 | 98 | 92 |
+| 1 | 98 | 96 | 98 | **100** |
+| 2 | 94 | 96 | 96 | 98 |
+| 3 | 98 | 96 | 94 | 98 |
+| 4 双杯分盘 | 98 | **100** | 98 | 98 |
+| 5 | 100 | 100 | 100 | 98 |
+| 6 | 90 | **100** | 94 | 96 |
+| 7 | 94 | 100 | 100 | **100** |
+| 8 双 moka pot | 60 | 76 | 66 | 64 |
+| 9 微波炉 | 88 | 78 | 60 | **94** |
+| **整体** | 91.6 | 93.2 | 90.4 | **93.8** |
+
+McNemar（逐集配对）：vs 臂 A = 28:17，p = 0.135（无差异）；vs 臂 D = 21:18，p = 0.749（无差异）；vs expert-only E0M3 = 37:20，**p = 0.033（显著更优，+3.4 点）**。
+
+每集耗时：全程 5h58m，均值 42.9s/集，与 expert-only E0M3 的 43-50s 同量级——prefix 图化 + PaliGemma E0M3 的加速被 episode 长度差异掩盖（成功率更高 ⇒ 难任务跑得更长；task8 失败集跑满 horizon，77.9s/集）。vs 臂 D fake-quant ~148s 约 3.4×。
+
+口径备忘（2026-08-23）：本项目四组延迟数字边界两两不同，禁止直接并排——臂 A/B/C = 进程内 `policy.infer` 整次墙钟（含 tokenize/D2H/反归一化，无网络）；FlashRT 27.21ms = `pipe.infer` 墙钟但 prompt 预设、不含 tokenize；server `policy_timing.infer_ms` = 仅 `sample_actions` 内层（含 tokenize 与 GPU 执行——计时区已加 sync，不含 D2H copy 本身/反归一化）；每集耗时混 episode 长度。路线 A 的精确 per-inference 数字用 `tools/bench_omega_e0m3_infer.py` 补测（臂 A 口径 + 内层诊断 + `graph_state` 自证，`noise=None` 才走图路径），命令见 handbook 路线 A 节第 3 步。
+
+per-inference 实测（2026-08-23，bench 图基线，fixture n=10 轮换，warmup 20 / iters 50，双侧 E0M3 + prefix/denoise 双图，`graph_state` 双 active）：**wall p50 308.0ms / mean 308.1 / p95 308.9（min 307.6，抖动 <1%，图重放确定性）**——同口径比臂 A bf16（137.2ms）**慢 2.2×**。归因修正（2026-08-23 二校）：消费层**并非**朴素反量化——`OmegaE0M3Linear.forward`（`tools/omega_e0m3_linear.py:146-182`）已走 FlashRT 上游 E0M3 FP4 快路径：激活经 `quantize_e0m3_dynamic_sfa_fp16`（`csrc/quantize/quantize_e0m3_sfa.cuh`）kernel 内动态 per-16 量化，GEMM 走 `cutlass_fp4_gemm_e0m3w`（`csrc/gemm/fp4/cutlass_fp4_gemm_e0m3w_sm100.cu`，CUTLASS tcgen05 FP4 tensor core，上游 v0.1.0 起维护、#164 更新）；纯 PyTorch 的只有 DuQuant 置换（index_select）+ 输入/输出旋转（64 块 bmm）+ bf16↔fp16 中转 cast（设计边界：置换/旋转复用 Omega 语义，不用 FlashRT 算子）。**308ms 的层级分解尚未 profile**，候选：denoise 小 m（suffix ~10 行）下 tcgen05 tile 利用率差、每层旋转/量化/cast 小 kernel 链在 ~1260 次线性调用/推理下累积、fp16 中转带宽。下一步：nsys 分解 bench eager 跑，定优化对象后再谈 kernel 级改造——"缺快 kernel"的判断作废，kernel 已在，慢在何处待定。⚠️ 本次 bench 的内层 `policy_timing.infer_ms` p50 0.84ms 是**修复前的异步读数**：当时 `policy.py` 的 `model_time` 在 `.cpu()` D2H 同步之前冻结，图模式下只测到 replay 发射开销。已在计时区间前后加 `torch.cuda.synchronize`（墙钟不受影响——`.cpu()` 本来就阻塞在同一批 GPU 工作上），修复后 `policy_timing.infer_ms` = 含 GPU 执行的模型段真实墙钟；server 端重采时该字段即为真实数字。两字段同名不同义仍在：`policy_timing.infer_ms` 只包 `sample_actions`（含 tokenize 与 GPU 执行，不含 D2H copy 本身/反归一化），server 端 `server_timing.infer_ms`（`websocket_policy_server.py:65-67`）包整个 `policy.infer`。交叉印证：42.9s/集 ÷ 308ms ≈ 139 次 infer/集，与 LIBERO episode 尺度一致。
+
+判读：
+
+1. **官方全-W4A4 配方 + E0M3 kernel 端到端成立**：93.8% 与臂 D（93.2%）、臂 A（91.6%）均无统计差异；上节 action cos 门禁在 500 集尺度兑现。
+2. **task9 崩盘被修复**：60% → 94%。expert-only 时代的唯一重灾区正是 PaliGemma 侧 RTN 掉点的症状，换 pack GPTQ 权重后恢复，呼应 action cos 里 e0m3/bf16 > fake/bf16 的方向。
+3. **task8（双 moka pot）64% 成为最弱任务**（A 60 / D 76）：四臂在 60-76% 区间本就很散，不定性为回归；需要深挖可按 task4/task9 的探针方法另开分析。
+4. 验证阶梯全部走完：artifact 252 层 → action cos 门禁 → 冒烟 10/10 → ×500 配对 SR。
+
 ## 后续行动
 
 - [x] 看 task4 的 failure 模式（探针复测：80% 失败为 3-5cm 擦边偏心，见上节）
@@ -493,6 +542,7 @@ Thor 验收：
 - [x] [切 C server] task4 带符号探针 + task9 探针（各 50 集）：task4 偏移定向（黄白杯 -y 2.1→4.0cm）；task9 掉点主因是"门没关"（24 失败全部门未关到位，15 个杯已放入），见上节
 - [x] FlashRT 复现（FP8 91.6% / NVFP4 92.6% 零掉点，FA4 27.21ms 对齐官方，见上两节）
 - [x] Omega-QVLA 臂 D 复现（W4A4/W4A8 hybrid 93.2%，与基线无统计差异，见上节）
+- [x] 路线 A ×500 配对 SR + 每集耗时（2026-08-23，见上节）：**93.8%**，vs 臂 A p=0.135 / 臂 D p=0.749 无差异，vs expert-only E0M3 p=0.033 显著更优（task9 60%→94%）；每集均值 42.9s（≈expert-only 43-50s，episode 长度混杂；vs 臂 D 148s 约 3.4×）。图模式 per-inference 已测：**308ms**（臂 A 口径，比 bf16 慢 2.2×，瓶颈在 E0M3 消费层无快 kernel，见上节）
 - [ ] TRT：评估 NVFP4 静态 scale / Dyna 算子融合（预期省 ~5-6 ms/次）
 - [ ] 评估 LLM 层与 expert denoise 的层级流水（重叠窗口 3.16 ms/step）
 - [ ] （可选）提高 tegrastats 采样率（--tegrastats-interval 20~50 ms）以加密 test 阶段 EMC 样本，当前 7/3 个样本只够看量级

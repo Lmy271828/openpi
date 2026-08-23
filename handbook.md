@@ -599,15 +599,19 @@ sudo docker logs -f pi05_server
 
 1. `[OMEGA-E0M3] installed: artifact=... (252 layers)`——monkeypatch 生效
 2. `[GR00T-GPTQ][REPLACED] ...` 照常打印（wrap 流程不变，换的是类）
-3. 默认只换 expert（GPTQ 侧），PaliGemma 仍 DuQuant fake-quant——有意的
-   半场对照；`OMEGA_E0M3_PATCH_DUQUANT=1` 才双侧全换
+3. `start_e0m3_server.sh` 默认 `OMEGA_E0M3_PATCH_DUQUANT=1`（路线 A：
+   双侧全换，PaliGemma 吃 pack 的 GPTQ W4A4 记录）；显式
+   `OMEGA_E0M3_PATCH_DUQUANT=0` 回旧的 expert-only 半场对照
 
 抓图模式（`OMEGA_E0M3_CUDA_GRAPH=1`）再加一项：
 
 4. `sudo docker logs pi05_server 2>&1 | grep "OMEGA-E0M3] cuda graph"`——
    期望 `installed` → 首次推理时 `captured (prefix_len=968, layers=18,
-   steps=10)`；出现 `DISABLED (...), eager fallback` 则捕获失败已回退
-   eager，把括号里的异常贴回来排查
+   steps=10)`；`OMEGA_E0M3_PREFIX_GRAPH=1`（默认）时还应有
+   `prefix graph: captured (prefix_len=968, layers=18)`。
+   `prefix graph: DISABLED` 只丢 prefix 图（prefix 回 eager，denoise 图
+   仍在）；`cuda graph: DISABLED` 才是全回退 eager，把括号里的异常
+   贴回来排查
 
 **3. 冒烟**（client 同臂 A 入口，只改输出目录；对照基准：
 omega_w4a4_smoke 9/10，且每集耗时应显著低于 fake-quant 的 ~148s）：
@@ -628,6 +632,271 @@ setsid nohup bash -c '
 成功率不离谱且延迟下降后，`--args.num-trials-per-task 50` 全量
 （输出 `eval_out/omega_e0m3_long`），与臂 A（91.6%）/ 臂 D（93.2%）
 逐集配对。
+
+### 路线 A：双侧 E0M3 + prefix 抓图（action cos + 端到端延迟）
+
+PaliGemma 从运行时 DuQuant fake-quant（RTN W4 + 默认 A8）切到 pack 的
+GPTQ W4A4 记录 + E0M3 kernel——Omega 官方 pack 配方本来就是全模型 W4A4
+（pack 内 PaliGemma 记录 `a_bits=4`，2026-08-22 直接读 pack 核实），
+所以路线 A 是对齐官方配方，同时把 PaliGemma 权重从 RTN 升级为 GPTQ。
+prefix prefill 同步入图（`omega_e0m3_graph.py` 双图）。转换器零改动
+（252 条记录全量转换，无侧区分支）；服务端两个开关在
+`tools/start_e0m3_server.sh` 已默认开：`OMEGA_E0M3_PATCH_DUQUANT=1`、
+`OMEGA_E0M3_PREFIX_GRAPH=1`。
+
+**0. 同步与 artifact 检查**（Thor）：
+
+```bash
+rsync -avz ~/pynoob/openpi/third_party/flashrt/tools/ \
+  hcclab@10.191.163.226:~/lmy/openpi/third_party/flashrt/tools/
+# artifact 必须含 252 层（expert 126 + PaliGemma 126）；是 126 就重跑转换器
+python3 -c "import torch; a=torch.load('$HOME/lmy/openpi/third_party/flashrt/pi05_long_e0m3.pt', map_location='cpu', weights_only=True, mmap=True); print(len(a['weights']))"
+```
+
+**1. action cos**（四类指标：action cos / action min-sample cos /
+raw cos / raw min-sample cos，对齐 `tests/bench_pi05_decoder_fp4_e2e.py`
+的定义；raw = unnormalize 前的归一化 action chunk）。harness：
+`tools/check_omega_e0m3_action_cos.py`，bf16 / fake-quant（臂 D 配方）/
+E0M3（路线 A）三模式各一个子进程，同 fixture 同噪声逐条配对。
+
+```bash
+# x86 host：录 policy 路径 fixture（libero_10 十任务各 1 条，已在本机验证）。
+# 注意 FlashRT 那份 libero_obs_2v_n8.npz 的 state 是 joint_pos+gripper 布局，
+# 不能直接喂 policy（policy 要 eef_pos+axisangle+gripper 的 8 维）
+cd ~/pynoob/openpi
+PYTHONPATH=third_party/libero:packages/openpi-client/src MUJOCO_GL=egl \
+  examples/libero/.venv/bin/python \
+  third_party/flashrt/tools/check_omega_e0m3_action_cos.py \
+  --record-fixture /tmp/pi05_libero10_obs_n10.npz
+rsync -avP /tmp/pi05_libero10_obs_n10.npz hcclab@10.191.163.226:~/lmy/openpi/
+
+# Thor（三子进程共占一张卡串行跑，含 40 次 warmup 让 fake 模式的在线
+# DuQuant 校准收敛；fake 模式无 PACKDIR 缓存、PaliGemma 126 层现场算
+# SVD pack，建议 tmux 里跑）。fixture 落在 ~/lmy/openpi/ 即容器内
+# /workspace，无需额外挂载 /tmp：
+sudo docker run --rm -it --runtime nvidia --network host \
+  --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v "$HOME/lmy/openpi":/workspace -v "$HOME/lmy/Omega-QVLA":/opt/omega \
+  -v "$HOME/.cache/openpi":/root/.cache/openpi \
+  -w /workspace openpi-pi0.5:l4t-jp7.2 \
+  bash -c "TF_DIR=/usr/local/lib/python3.12/dist-packages/transformers && \
+           cp -r src/openpi/models_pytorch/transformers_replace/* \$TF_DIR/ && \
+           export PYTHONPATH=packages/openpi-client/src:src:.:/opt/omega:/workspace/third_party/flashrt && \
+           python -u third_party/flashrt/tools/check_omega_e0m3_action_cos.py \
+             --checkpoint /root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch \
+             --pack /opt/omega/packs_hf/pi05_long/quantized.pt \
+             --artifact /workspace/third_party/flashrt/pi05_long_e0m3.pt \
+             --fixture /workspace/pi05_libero10_obs_n10.npz \
+             --output-dir /workspace/eval_out/action_cos_routeA"
+```
+
+判读：`e0m3_vs_fake` 是 kernel 化纯损耗（应显著高于另两对，单层 S0
+已验证不劣于 fake-quant 自身）；`fake_vs_bf16` 是配方自身保真参考线；
+`e0m3_vs_bf16` 是端到端总账。参考门槛沿用 NVFP4 bench（action cos
+0.999 / min-sample 0.995 / raw 0.995/0.995），首轮先不设硬门禁，
+需要时加 `--gate`。子进程日志 `eval_out/action_cos_routeA/{bf16,fake,e0m3}.log`
+（Thor 宿主机路径，即容器内 `/workspace/eval_out/action_cos_routeA/`），
+汇总 `result.json`；各模式 eager p50 推理耗时一并打印（含 prefix）。
+
+**2. 端到端延迟 + 成功率**（路线 A 默认配置）：
+
+```bash
+bash ~/lmy/openpi/third_party/flashrt/tools/start_e0m3_server.sh
+sudo docker logs -f pi05_server
+```
+
+冒烟 → 全量（client 同臂 A 入口，只改输出目录）：
+
+```bash
+cd ~/pynoob/openpi
+setsid nohup bash -c '
+  source examples/libero/.venv/bin/activate &&
+  export PYTHONPATH=$PYTHONPATH:$PWD/third_party/libero &&
+  python examples/libero/main.py \
+    --args.task-suite-name libero_10 --args.num-trials-per-task 1 \
+    --args.host 10.191.163.226 --args.port 8000 \
+    --args.video-out-path eval_out/omega_routeA_smoke
+' > eval_out/omega_routeA_smoke.log 2>&1 < /dev/null &
+# 冒烟 10 集成功率不离谱后 --args.num-trials-per-task 50
+# （输出 eval_out/omega_routeA_long，日志 eval_out/omega_routeA_long.log）
+```
+
+对照基线：臂 D fake-quant 93.2% / ~148s 每集；expert-only E0M3 90.4% /
+43–50s（prefix eager）。实测（2026-08-23）：**93.8%**（vs A p=0.135 /
+D p=0.749 无差异 / expert-only p=0.033 显著更优，task9 60%→94%），
+每集均值 42.9s——与 expert-only 同量级；episode 长度混杂（成功率更高 ⇒
+难任务跑得更长）使每集墙钟不能作延迟结论，精确延迟用下面的 bench。
+逐任务表与判读见 `analysis.md` 路线 A 节。
+
+**3. per-inference 延迟（臂 A 口径）**：`tools/bench_omega_e0m3_infer.py`——
+墙钟包住整个 `policy.infer`（与臂 A/B/C 的 137.2/85.8/49.9ms 同口径），
+内层 `infer_ms`（模型段）作诊断一并打印；输出带 `graph_state` 自证图
+模式，没有它不算图模式数字。每次调用 `noise=None`（传噪声会静默回退
+eager）。先停 server 再跑：
+
+```bash
+sudo docker rm -f pi05_server
+sudo docker run --rm -it --runtime nvidia --network host \
+  --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v "$HOME/lmy/openpi":/workspace -v "$HOME/lmy/Omega-QVLA":/opt/omega \
+  -v "$HOME/.cache/openpi":/root/.cache/openpi \
+  -w /workspace openpi-pi0.5:l4t-jp7.2 \
+  bash -c "TF_DIR=/usr/local/lib/python3.12/dist-packages/transformers && \
+           cp -r src/openpi/models_pytorch/transformers_replace/* \$TF_DIR/ && \
+           export PYTHONPATH=packages/openpi-client/src:src:.:/opt/omega:/workspace/third_party/flashrt && \
+           python -u third_party/flashrt/tools/bench_omega_e0m3_infer.py \
+             --checkpoint /root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch \
+             --pack /opt/omega/packs_hf/pi05_long/quantized.pt \
+             --artifact /workspace/third_party/flashrt/pi05_long_e0m3.pt \
+             --fixture /workspace/pi05_libero10_obs_n10.npz"
+# 参考臂：追加 --eager（不装图）
+```
+
+延迟口径速查（四组数字边界两两不同，禁止直接并排）：
+
+| 数字 | 计时区间 | 不含 |
+|---|---|---|
+| 臂 A/B/C 137.2/85.8/49.9ms | 进程内 `policy.infer` 整次墙钟 | 网络 |
+| FlashRT 27.21ms（NVFP4+FA4） | 进程内 `pipe.infer` 墙钟 | 网络、tokenize（prompt 预设） |
+| server `policy_timing.infer_ms` | 仅 `sample_actions`（含 tokenize 与 GPU 执行；计时区已加 sync） | 输入 transform、D2H copy 本身、反归一化 |
+| 评测每集耗时 | episode 墙钟 | —（混 episode 长度） |
+
+`--fa4` 臂：Gemma 注意力（PaliGemma LM + action expert 一处覆盖）走
+FlashRT vendored FA4 kernel（`tools/omega_fa4_attention.py`，从 additive
+4D mask 还原有效 key 列后物理压实调用，`causal=False` 双向块语义）。
+mask→索引是 host 侧数据相关操作、破 CUDA graph 捕获，故 `--fa4` 强制
+`--eager`；图化 FA4 需按 prompt 长度逐长度抓图（见 `analysis.md`）。
+容器需先装 thor-fa4 依赖，且 `CUTE_DSL_ARCH=sm_101a` 必须在进程启动前
+export——dsl 4.5.1 的 sm_110a 默认路径触发 NVVM chip-string bug，shim
+内的 setdefault 若晚于首次 `import cutlass` 则无效（踩坑记录见
+`analysis.md` FA4 补齐节），不能依赖它。完整三跑 + 数值门禁：
+
+```bash
+# 每次 docker run 的 bash -c 内、python 之前追加（容器是临时的）：
+pip install -q nvidia-cutlass-dsl==4.5.1 quack-kernels==0.4.1
+export CUTE_DSL_ARCH=sm_101a
+
+# 跑 1 图基线：上文原命令不动
+# 跑 2 eager 参考臂：追加
+#   --eager --save-actions /workspace/eval_out/bench_eager_actions.npy
+# 跑 3 FA4 臂：追加（自动带上 --eager）
+#   --fa4 --save-actions /workspace/eval_out/bench_fa4_actions.npy
+
+# 数值门禁（跑 3 vs 跑 2，逐 iter 余弦；容器退后在 Thor 宿主跑）：
+python - <<'EOF'
+import numpy as np
+a = np.load(f"/home/$USER/lmy/openpi/eval_out/bench_eager_actions.npy")
+b = np.load(f"/home/$USER/lmy/openpi/eval_out/bench_fa4_actions.npy")
+cos = (a*b).sum(-1) / (np.linalg.norm(a, axis=-1) * np.linalg.norm(b, axis=-1))
+print(f"FA4 vs eager action cos: min={cos.min():.5f} mean={cos.mean():.5f}")
+EOF
+```
+
+**nsys kernel 级分解**（回答"per-inference 时间花在哪"）：eager 一跑归因
+最干净；CUPTI 有采集开销，只看 kernel 占比、不看绝对墙钟。产物落宿主
+`perf_data/`：
+
+```bash
+sudo docker rm -f pi05_server  # 先停 server
+sudo docker run --rm -it --runtime nvidia --network host \
+  --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v "$HOME/lmy/openpi":/workspace -v "$HOME/lmy/Omega-QVLA":/opt/omega \
+  -v "$HOME/.cache/openpi":/root/.cache/openpi \
+  -w /workspace openpi-pi0.5:l4t-jp7.2 \
+  bash -c "TF_DIR=/usr/local/lib/python3.12/dist-packages/transformers && \
+           cp -r src/openpi/models_pytorch/transformers_replace/* \$TF_DIR/ && \
+           export PYTHONPATH=packages/openpi-client/src:src:.:/opt/omega:/workspace/third_party/flashrt && \
+           mkdir -p perf_data && \
+           nsys profile -o perf_data/omega_e0m3_bench_eager --force-overwrite=true \
+             -t cuda \
+             python -u third_party/flashrt/tools/bench_omega_e0m3_infer.py \
+               --checkpoint /root/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch \
+               --pack /opt/omega/packs_hf/pi05_long/quantized.pt \
+               --artifact /workspace/third_party/flashrt/pi05_long_e0m3.pt \
+               --fixture /workspace/pi05_libero10_obs_n10.npz --eager && \
+           nsys stats perf_data/omega_e0m3_bench_eager.nsys-rep \
+             --report cuda_gpu_kern_sum --report cuda_gpu_mem_time_sum \
+             --report cuda_api_sum --format csv --force-export=true \
+             -o perf_data/omega_e0m3_bench_eager"
+```
+
+读 `perf_data/omega_e0m3_bench_eager_cuda_gpu_kern_sum.csv`，按 kernel 名
+归堆：`cutlass_fp4_gemm_e0m3w`（FP4 GEMM）/ `quantize_e0m3*`（激活量化）/
+bmm+index_select（DuQuant 置换+旋转 glue）/ SDPA（注意力）/ cublas bf16
+大 GEMM（vision tower 与未量化残余）。去掉 `--eager` 同法可采图模式对照
+（graph 重放内 kernel 在 nsys 里仍逐条可见）。DRAM/EMC 侧要补 tegrastats
+的话沿用 `deployment_scripts/collect_perf_data.sh` 的嵌套采法。
+
+### MIP 2-step × W4A4 QAT（Much-ado-about-noising 移植）
+
+从 pi05_libero checkpoint 出发，用 MIP teacher-free 两步损失微调 +
+expert W4A4 fake-quant QAT，目标 2 步推理。实现与约定映射见
+`src/openpi/models_pytorch/mip_qat.py` 头部 docstring（测试：
+`mip_qat_test.py`，5 项）。要点：
+
+- MIP 两步规约为未修改的 `PI0Pytorch.forward(noise=..., time=...)` 两次调用：
+  step1 `noise=0, time=1.0`（loss ×1/t*²），step2 `noise=act+η, time=1-t*`（不再除）
+- t* = 0.9；推理 = `PI05_T_GRID="1.0:-1.0;0.1:-0.1"` + **零噪声起步**
+  （serve_omega_e0m3.py 在 T_GRID 设置时自动开 `OMEGA_E0M3_ZERO_NOISE`
+  并跳过 10 步抓图）
+- QAT 数值对齐 E0M3 部署：权重 per-16 amax/7、激活 per-token 动态 amax、
+  码值 [-7,7]、STE 直通；v1 不带 DuQuant 旋转（S0 语义）
+
+**1. 训练**（笔记本 `.venv-train`，torch cu128 / sm_120；主 .venv 的
+cu126 在 RTX 5060 上无 kernel 可用）。checkpoint 从 Thor rsync（GCS 只有
+JAX 版）：
+
+```bash
+rsync -avzP hcclab@10.191.163.226:~/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch \
+  ~/.cache/openpi/openpi-assets/checkpoints/
+
+cd ~/pynoob/openpi
+HF_ENDPOINT=https://hf-mirror.com .venv-train/bin/python scripts/train_mip_qat.py \
+  --exp_name mip_qat_v1 --batch_size 8 --num_train_steps 5000 --qat
+```
+
+冻结 paligemma（ViT+LLM），只训 action expert + 投影（~300M，
+PagedAdamW8bit）。OOM 回退：batch 8→4→2。checkpoints 在
+`checkpoints/<exp_name>/<step>/model.safetensors`。
+
+**2. 导出 E0M3 artifact**（Thor，kernel 依赖；checkpoint 先 rsync 过去）：
+
+```bash
+rsync -avzP ~/pynoob/openpi/checkpoints/mip_qat_v1/5000/model.safetensors \
+  hcclab@10.191.163.226:~/lmy/openpi/checkpoints/mip_qat_v1/5000/
+# Thor 上
+cd ~/lmy/openpi/third_party/flashrt
+python tools/convert_qat_ckpt_e0m3.py \
+  --ckpt ~/lmy/openpi/checkpoints/mip_qat_v1/5000/model.safetensors \
+  --out pi05_mip2step_e0m3.pt --keep-fp16
+```
+
+产出 126 层（expert），identity 旋转 + 全 1 表（S0）。验收：artifact
+单层 cos（QAT 前向 vs kernel 前向）应 > 0.999——远高于 PTQ 的 0.986，
+这是 QAT 的核心收益点。
+
+**3. Thor 起 2 步服务**：QAT checkpoint 需组装成完整服务目录（模型权重
+换掉、assets/norm stats 沿用 base）：
+
+```bash
+# Thor 上
+rsync -a ~/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch/ \
+  ~/ckpts/pi05_mip_qat/
+cp ~/lmy/openpi/checkpoints/mip_qat_v1/5000/model.safetensors ~/ckpts/pi05_mip_qat/
+
+OMEGA_E0M3_PACK=/workspace/third_party/flashrt/pi05_mip2step_e0m3.pt \
+PI05_T_GRID="1.0:-1.0;0.1:-0.1" \
+E0M3_MODEL_PATH=/root/ckpts/pi05_mip_qat \
+  bash ~/lmy/openpi/third_party/flashrt/tools/start_e0m3_server.sh
+```
+
+（`E0M3_MODEL_PATH` 透传若脚本未支持则手改 --model_path；启动日志应见
+`zero-noise sampling installed (MIP mode)` + `cuda graph: skipped`。）
+
+**4. 评测**：冒烟 10 集 → LIBERO-10 ×500（命令同 §3 冒烟，改输出目录
+`omega_mip2step_*`）。对照基线：10 步 E0M3 90.4% / 43-50s 每集；
+预期 expert 耗时降为 ~1/5（2 NFE vs 10）。
+
 ---
 
 ## 复现检查清单
@@ -639,6 +908,13 @@ setsid nohup bash -c '
 - [ ] nsys GPU metrics 分阶段饱和度（SMs Active / SM Issue / Tensor Active × prefill / expert）
 - [ ] libero_10 三臂成功率：A ~91.6% / B ~93.0% / C ~80.0%（各 500 episodes）；
   臂 D（Omega W4A4）~93.2%；臂 D+E0M3 kernel ~90.4%（vs A p=0.53 / vs D p=0.07）
+- [x] 路线 A（双侧 E0M3 + prefix 图）：action cos 四项全过 NVFP4 门禁
+  （e0m3/bf16 = 0.99940/0.99694/0.99872/0.99512；fake/bf16 反而全不过——
+  pack GPTQ 优于运行时 RTN 的直接证据）；冒烟 10/10；×500 全量 **93.8%**
+  （vs A 91.6% p=0.135 / vs D 93.2% p=0.749 无差异 / vs expert-only E0M3
+  90.4% p=0.033 显著更优，task9 60%→94%）；每集均值 42.9s（episode 长度
+  混杂，精确 per-inference 延迟用 `bench_omega_e0m3_infer.py` 补测）
+  （2026-08-23，见"路线 A"节）
 - [ ] LIBERO-Plus 子集：A ~81.4% / C ~64.3% / D ~76.7%（各 210 episodes）
 
 ---
