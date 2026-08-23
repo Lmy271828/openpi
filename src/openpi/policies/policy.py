@@ -88,11 +88,20 @@ class Policy(BasePolicy):
             sample_kwargs["noise"] = noise
 
         observation = _model.Observation.from_dict(inputs)
+        if self._is_pytorch_model:
+            # CUDA launches are async; without syncing, model_time stops at
+            # launch time and misses all GPU execution (CUDA-graph replays
+            # report sub-ms "infer" times). Sync before as well so queued work
+            # from a previous call is not attributed to this one. Wall clock is
+            # unaffected — the .cpu() below blocks on the same work anyway.
+            torch.cuda.synchronize(self._pytorch_device)
         start_time = time.monotonic()
         outputs = {
             "state": inputs["state"],
             "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
         }
+        if self._is_pytorch_model:
+            torch.cuda.synchronize(self._pytorch_device)
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
