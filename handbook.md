@@ -834,13 +834,18 @@ quantize_e0m3_duquant.cu`，warp-per-64-block，数值复现 PyTorch 舍入链�
 增量重编（几分钟）：
 
 ```bash
+# 先确认 cutlass 是挂载树里的实体目录（v4.4.2；不是指向 /opt/cutlass 的死链——
+# 那是 flashrt 镜像里的路径）：
+ls ~/lmy/openpi/third_party/flashrt/third_party/cutlass/include/cutlass/cutlass.h
+
+# 现存 build/ 树若是在宿主机上配置的（cache 记宿主路径 + 失效的 venv cmake），
+# 容器内会报 "CMakeCache.txt directory ... is different"——抹掉重配即可；
+# 只编 fp4 模块（消费层只需要它），别全量：
 sudo docker run --rm -it --runtime nvidia \
   -v "$HOME/lmy/openpi":/workspace -w /workspace/third_party/flashrt \
   openpi-pi0.5:l4t-jp7.2 \
-  bash -c "cmake --build build -j\$(nproc)"
-# 若 cmake 报 CUTLASS 路径失效（build 树是在别的镜像里配的），先
-# grep CUTLASS_DIR build/CMakeCache.txt 确认路径，必要时重跑
-# cmake -B build -S . -DGPU_ARCH=110（需要镜像内有 cutlass 4.x 头）
+  bash -c "rm -rf build && cmake -B build -S . -DGPU_ARCH=110 && \
+           cmake --build build --target flash_rt_fp4 -j\$(nproc)"
 ```
 
 重编前代码自动走原 PyTorch glue 路径（`hasattr` 探测，行为不变）。验证：
