@@ -827,6 +827,25 @@ bmm+index_select（DuQuant 置换+旋转 glue）/ SDPA（注意力）/ cublas bf
 （graph 重放内 kernel 在 nsys 里仍逐条可见）。DRAM/EMC 侧要补 tegrastats
 的话沿用 `deployment_scripts/collect_perf_data.sh` 的嵌套采法。
 
+**融合 glue kernel（quantize_e0m3_duquant）**：消费层的 perm+旋转+cast+
+量化 / 旋转+cast+bias 已各融成单 kernel（`csrc/quantize/
+quantize_e0m3_duquant.cu`，warp-per-64-block，数值复现 PyTorch 舍入链）。
+`.so` 在挂载树 `third_party/flashrt/flash_rt/` 里，拉到该提交后在容器内
+增量重编（几分钟）：
+
+```bash
+sudo docker run --rm -it --runtime nvidia \
+  -v "$HOME/lmy/openpi":/workspace -w /workspace/third_party/flashrt \
+  openpi-pi0.5:l4t-jp7.2 \
+  bash -c "cmake --build build -j\$(nproc)"
+# 若 cmake 报 CUTLASS 路径失效（build 树是在别的镜像里配的），先
+# grep CUTLASS_DIR build/CMakeCache.txt 确认路径，必要时重跑
+# cmake -B build -S . -DGPU_ARCH=110（需要镜像内有 cutlass 4.x 头）
+```
+
+重编前代码自动走原 PyTorch glue 路径（`hasattr` 探测，行为不变）。验证：
+`tools/check_omega_e0m3_layer.py` 单层对照 → action cos 门禁 → bench。
+
 ### MIP 2-step × W4A4 QAT（Much-ado-about-noising 移植）
 
 从 pi05_libero checkpoint 出发，用 MIP teacher-free 两步损失微调 +
